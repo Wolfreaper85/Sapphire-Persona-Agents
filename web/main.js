@@ -190,6 +190,7 @@ function _buildLayout() {
                 <div class="pa-chat-bar">
                     <textarea class="pa-chat-input" id="pa-chat-input" placeholder="Talk to your lead persona..." rows="1"></textarea>
                     <button class="pa-btn pa-btn-send" id="pa-chat-send" title="Send">\u{27A4}</button>
+                    <button class="pa-btn pa-btn-stop" id="pa-chat-stop" title="Stop generating" style="display:none">\u{23F9}</button>
                     <button class="pa-btn pa-btn-tts-bar" id="pa-bar-tts" title="Play / stop last response TTS">\u{1F50A}</button>
                 </div>
             </div>
@@ -252,6 +253,7 @@ function _bindEvents(el) {
 
     // Chat input — sends to the active chat (talks to lead persona)
     el.querySelector('#pa-chat-send').addEventListener('click', () => _sendChat());
+    el.querySelector('#pa-chat-stop').addEventListener('click', () => _stopChat());
     el.querySelector('#pa-chat-input').addEventListener('keydown', e => {
         if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); _sendChat(); }
     });
@@ -648,10 +650,12 @@ function _startListening() {
             _aiTyping = true;
             _startLiveTurn();
             _setOrbState('thinking');
+            _showStopButton(true);
         }),
         eventBus.on('ai_typing_end', () => {
             _aiTyping = false;
             _endLiveTurn();
+            _showStopButton(false);
             // Only fetch transcript ONCE when streaming ends (not during)
             _fetchTranscript(true);
             setTimeout(() => _fetchTranscript(true), 2000);
@@ -1749,6 +1753,24 @@ async function _sendChat() {
         // Restore text on failure
         input.value = text;
     }
+}
+
+async function _stopChat() {
+    try {
+        await fetch('/api/cancel', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF() },
+        });
+    } catch (e) {
+        console.error('[PA] Cancel failed:', e);
+    }
+}
+
+function _showStopButton(show) {
+    const sendBtn = document.getElementById('pa-chat-send');
+    const stopBtn = document.getElementById('pa-chat-stop');
+    if (sendBtn) sendBtn.style.display = show ? 'none' : '';
+    if (stopBtn) stopBtn.style.display = show ? '' : 'none';
 }
 
 // ─── Live Streaming — Segment Tracking ─────────────────────────────────────
@@ -3146,6 +3168,17 @@ function _injectStyles() {
     transition: background 0.15s; flex-shrink: 0;
 }
 .pa-btn-send:hover { background: #3a8eef; }
+.pa-btn-stop {
+    background: #e74c3c; border: none; color: #fff; padding: 10px 16px;
+    border-radius: 8px; cursor: pointer; font-size: 1rem;
+    transition: background 0.15s; flex-shrink: 0;
+    animation: pa-pulse-stop 1.5s ease-in-out infinite;
+}
+.pa-btn-stop:hover { background: #c0392b; }
+@keyframes pa-pulse-stop {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.7; }
+}
 
 /* Bar TTS button (next to send) */
 .pa-btn-tts-bar {
