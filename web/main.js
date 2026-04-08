@@ -848,21 +848,11 @@ function _renderTranscript(chatMessages, delTranscript, activeDelegates) {
         timeline.push({ sort_time: msg.timestamp || '', kind: 'chat', data: msg });
     }
 
-    // Add delegation transcript entries — but skip if already covered by chat history
-    // Chat history already contains delegate_task tool calls/results, so the delegation
-    // transcript (dispatch/result) entries would be duplicates. Only add entries that
-    // DON'T overlap with chat messages (e.g., entries from before history was loaded,
-    // or entries for other chats).
-    const chatTimestamps = new Set(chatMessages.map(m => m.timestamp).filter(Boolean));
-    const hasHistoryDelegations = chatMessages.some(m =>
-        m.role === 'assistant' && m.parts?.some(p => p.type === 'tool_call' && p.name === 'delegate_task')
-    );
+    // Add delegation transcript entries — these carry the delegate's persona identity
+    // (avatar, name, in-character response) so they're the preferred view.
+    // Chat history delegate_task messages are already skipped above (split into
+    // pre/post segments), so we don't get duplicates.
     for (const entry of delTranscript) {
-        // If chat history already has delegation tool calls, skip transcript dispatch/result
-        // entries — they're the same data from a different source
-        if (hasHistoryDelegations && (entry.type === 'dispatch' || entry.type === 'result')) {
-            continue;
-        }
         timeline.push({ sort_time: entry.timestamp || '', kind: entry.type, data: entry });
     }
 
