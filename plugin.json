@@ -7,6 +7,9 @@
     "default_enabled": true,
     "priority": 55,
     "capabilities": {
+        "daemon": {
+            "entry": "daemon.py"
+        },
         "tools": [
             "tools/persona_agents.py"
         ],

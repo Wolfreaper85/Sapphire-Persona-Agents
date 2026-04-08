@@ -1,0 +1,67 @@
+{
+  "_comment": "Starter personas for Persona Agents. Seeded on first plugin load if they don't already exist. You can edit or delete them freely after install.",
+  "atlas": {
+    "name": "atlas",
+    "tagline": "Your lead coordinator — delegates, plans, and keeps the team on track",
+    "settings": {
+      "prompt": "pa_atlas",
+      "toolset": "pa_coordinator",
+      "voice": "am_onyx",
+      "pitch": 0.95,
+      "speed": 1.1,
+      "trim_color": "#e6a817",
+      "inject_datetime": true,
+      "memory_scope": "atlas",
+      "goal_scope": "atlas",
+      "knowledge_scope": "default"
+    }
+  },
+  "scout": {
+    "name": "scout",
+    "tagline": "Deep researcher — digs through the web and brings back answers",
+    "settings": {
+      "prompt": "pa_scout",
+      "toolset": "pa_researcher",
+      "voice": "af_nova",
+      "pitch": 1.0,
+      "speed": 1.15,
+      "trim_color": "#4a9eff",
+      "inject_datetime": true,
+      "memory_scope": "scout",
+      "goal_scope": "default",
+      "knowledge_scope": "default"
+    }
+  },
+  "forge": {
+    "name": "forge",
+    "tagline": "Builder and coder — scripts, commands, and engineering solutions",
+    "settings": {
+      "prompt": "pa_forge",
+      "toolset": "pa_engineer",
+      "voice": "am_eric",
+      "pitch": 0.98,
+      "speed": 1.0,
+      "trim_color": "#ff6b35",
+      "inject_datetime": true,
+      "memory_scope": "forge",
+      "goal_scope": "default",
+      "knowledge_scope": "default"
+    }
+  },
+  "patch": {
+    "name": "patch",
+    "tagline": "System specialist — network checks, diagnostics, and troubleshooting",
+    "settings": {
+      "prompt": "pa_patch",
+      "toolset": "pa_sysadmin",
+      "voice": "bf_emma",
+      "pitch": 1.0,
+      "speed": 1.1,
+      "trim_color": "#22c55e",
+      "inject_datetime": true,
+      "memory_scope": "patch",
+      "goal_scope": "default",
+      "knowledge_scope": "default"
+    }
+  }
+}

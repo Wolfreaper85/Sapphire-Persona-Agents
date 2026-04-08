@@ -28,7 +28,7 @@ export default {
 
 let _container = null;
 let _allPersonas = [];
-let _ttsPlayer = null;
+let _ttsPlayer = null;  // Legacy — kept for compat, use _ttsPlaying instead
 let _selectedChat = '';           // '' = current active chat
 let _viewVisible = false;
 let _unsubscribers = [];         // Event listener cleanup
@@ -507,6 +507,20 @@ function _renderTranscript(chatMessages, delTranscript, activeDelegates) {
         btn.addEventListener('click', () => _playTts(btn));
     });
 
+    // Bind message action buttons
+    container.querySelectorAll('.pa-regen-btn').forEach(btn => {
+        btn.addEventListener('click', () => _regenFromButton(btn));
+    });
+    container.querySelectorAll('.pa-copy-btn').forEach(btn => {
+        btn.addEventListener('click', () => _copyFromButton(btn));
+    });
+    container.querySelectorAll('.pa-delete-btn').forEach(btn => {
+        btn.addEventListener('click', () => _deleteFromButton(btn));
+    });
+    container.querySelectorAll('.pa-tts-msg-btn').forEach(btn => {
+        btn.addEventListener('click', () => _ttsMsgFromButton(btn));
+    });
+
     // Update thinking orb state
     _updateOrbFromTranscript(delTranscript, activeDelegates, chatMessages);
 
@@ -572,13 +586,19 @@ function _renderChatMessage(msg) {
     const timeHtml = ts ? `<span class="pa-chat-time">${ts}</span>` : '';
 
     if (role === 'user') {
-        return `<div class="pa-chat-msg pa-chat-user">
+        // Store raw user text for regen lookups
+        const safeText = text.replace(/'/g, '&#39;').replace(/"/g, '&quot;');
+        return `<div class="pa-chat-msg pa-chat-user" data-user-text="${safeText}">
             <div class="pa-chat-bubble pa-bubble-user">
                 <div class="pa-chat-role">
                     <img class="pa-chat-avatar" src="${_userAvatarUrl}"
                          onerror="this.src='/static/users/user.webp'">
                     <span>You</span>
                     ${timeHtml}
+                    <span class="pa-msg-actions">
+                        <button class="pa-action-btn pa-copy-btn" title="Copy">\u{1F4CB}</button>
+                        <button class="pa-action-btn pa-delete-btn" title="Delete from here">\u{1F5D1}</button>
+                    </span>
                 </div>
                 ${text ? `<div class="pa-chat-text">${_esc(text)}</div>` : ''}
             </div>
@@ -619,6 +639,12 @@ function _renderChatMessage(msg) {
                     <span style="color:${color}">${_esc(personaName)}</span>
                     ${modelTag}${toolTag}
                     ${timeHtml}
+                    <span class="pa-msg-actions">
+                        <button class="pa-action-btn pa-copy-btn" title="Copy">\u{1F4CB}</button>
+                        <button class="pa-action-btn pa-tts-msg-btn" title="Play TTS">\u{1F50A}</button>
+                        <button class="pa-action-btn pa-regen-btn" title="Regenerate">\u{1F504}</button>
+                        <button class="pa-action-btn pa-delete-btn" title="Delete from here">\u{1F5D1}</button>
+                    </span>
                 </div>
                 ${thinkHtml}
                 ${text ? `<div class="pa-chat-text">${_esc(text).replace(/\n/g, '<br>')}</div>` : ''}
@@ -740,14 +766,10 @@ function _renderActive(d) {
 // ─── TTS ────────────────────────────────────────────────────────────────────
 
 async function _playTts(btn) {
-    // Stop any current playback
-    if (_ttsPlayer) {
-        _ttsPlayer.pause();
-        _ttsPlayer = null;
-        document.querySelectorAll('.pa-tts-playing, .pa-tts-loading').forEach(b => {
-            b.classList.remove('pa-tts-playing', 'pa-tts-loading');
-        });
-        if (btn.classList.contains('pa-tts-playing') || btn.classList.contains('pa-tts-loading')) return;
+    // If playing, stop
+    if (_ttsPlaying) {
+        await _stopTts();
+        return;
     }
 
     const msg = btn.closest('.pa-message');
@@ -757,37 +779,25 @@ async function _playTts(btn) {
     btn.classList.add('pa-tts-loading');
 
     try {
-        const body = { text: text.substring(0, 3000) };
-        if (btn.dataset.voice) body.voice = btn.dataset.voice;
-        if (btn.dataset.pitch) body.pitch = parseFloat(btn.dataset.pitch);
-        if (btn.dataset.speed) body.speed = parseFloat(btn.dataset.speed);
-
-        const resp = await fetch('/api/tts/speak', {
+        const resp = await fetch('/api/tts', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF() },
-            body: JSON.stringify(body),
+            body: JSON.stringify({ text: text.substring(0, 3000), output_mode: 'play' }),
         });
-
         if (!resp.ok) throw new Error(`TTS error: ${resp.status}`);
-
-        const blob = await resp.blob();
-        const url = URL.createObjectURL(blob);
-        _ttsPlayer = new Audio(url);
 
         btn.classList.remove('pa-tts-loading');
         btn.classList.add('pa-tts-playing');
+        _ttsPlaying = true;
 
-        _ttsPlayer.onended = () => {
-            btn.classList.remove('pa-tts-playing');
-            URL.revokeObjectURL(url);
-            _ttsPlayer = null;
-        };
-        _ttsPlayer.onerror = () => {
-            btn.classList.remove('pa-tts-playing');
-            URL.revokeObjectURL(url);
-            _ttsPlayer = null;
-        };
-        _ttsPlayer.play();
+        const words = text.split(/\s+/).length;
+        const durationMs = Math.max(2000, (words / 150) * 60000);
+        setTimeout(() => {
+            if (_ttsPlaying) {
+                _ttsPlaying = false;
+                btn.classList.remove('pa-tts-playing');
+            }
+        }, durationMs);
     } catch (e) {
         btn.classList.remove('pa-tts-loading');
         console.error('[PA] TTS failed:', e);
@@ -1174,6 +1184,136 @@ async function _clearTranscript() {
 
 // ─── Chat Input ─────────────────────────────────────────────────────────────
 
+// ─── Message Action Handlers ───────────────────────────────────────────────
+
+function _copyFromButton(btn) {
+    const bubble = btn.closest('.pa-chat-bubble');
+    if (!bubble) return;
+    const textEl = bubble.querySelector('.pa-chat-text');
+    const text = textEl ? textEl.textContent : '';
+    if (!text) return;
+    navigator.clipboard.writeText(text).then(() => {
+        btn.textContent = '\u2705';
+        setTimeout(() => { btn.textContent = '\u{1F4CB}'; }, 1500);
+    });
+}
+
+async function _deleteFromButton(btn) {
+    const msgEl = btn.closest('.pa-chat-msg');
+    if (!msgEl) return;
+
+    // Find the user message text — either this IS a user msg, or find the one before
+    let userText = msgEl.dataset.userText;
+    if (!userText) {
+        // Assistant message — find preceding user message
+        let prev = msgEl.previousElementSibling;
+        while (prev && !prev.dataset.userText) {
+            prev = prev.previousElementSibling;
+        }
+        userText = prev?.dataset.userText;
+    }
+    if (!userText) return;
+
+    userText = userText.replace(/&#39;/g, "'").replace(/&quot;/g, '"');
+
+    try {
+        await fetch('/api/history/messages', {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF() },
+            body: JSON.stringify({ user_message: userText }),
+        });
+        _completedTurns.clear();
+        _fetchTranscript(true);
+    } catch (e) {
+        console.error('[PA] Delete failed:', e);
+    }
+}
+
+function _ttsMsgFromButton(btn) {
+    // If already playing, stop
+    if (_ttsPlaying) {
+        _stopTts();
+        return;
+    }
+    const bubble = btn.closest('.pa-chat-bubble');
+    if (!bubble) return;
+    const textEl = bubble.querySelector('.pa-chat-text');
+    const text = textEl ? textEl.textContent : '';
+    if (!text) return;
+    _playTtsText(text, btn);
+}
+
+async function _playTtsText(text, btn) {
+    if (!text) return;
+    if (btn) btn.classList.add('pa-tts-loading');
+    try {
+        const resp = await fetch('/api/tts', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF() },
+            body: JSON.stringify({ text, output_mode: 'play' }),
+        });
+        if (!resp.ok) throw new Error('TTS failed');
+        if (btn) {
+            btn.classList.remove('pa-tts-loading');
+            btn.classList.add('pa-tts-playing');
+        }
+        _ttsPlaying = true;
+        const words = text.split(/\s+/).length;
+        const durationMs = Math.max(2000, (words / 150) * 60000);
+        setTimeout(() => {
+            if (_ttsPlaying) {
+                _ttsPlaying = false;
+                if (btn) btn.classList.remove('pa-tts-playing');
+            }
+        }, durationMs);
+    } catch (e) {
+        if (btn) {
+            btn.classList.remove('pa-tts-loading');
+            btn.classList.remove('pa-tts-playing');
+        }
+        console.error('[PA] TTS failed:', e);
+    }
+}
+
+async function _regenFromButton(btn) {
+    // Walk up to find the assistant bubble, then look backwards for the preceding user message
+    const assistantMsg = btn.closest('.pa-chat-msg');
+    if (!assistantMsg) return;
+
+    // Find the previous user message in the DOM
+    let userMsg = assistantMsg.previousElementSibling;
+    while (userMsg && !userMsg.dataset.userText) {
+        userMsg = userMsg.previousElementSibling;
+    }
+    if (!userMsg?.dataset.userText) {
+        console.warn('[PA] No user message found to regenerate from');
+        return;
+    }
+
+    const userText = userMsg.dataset.userText
+        .replace(/&#39;/g, "'").replace(/&quot;/g, '"');
+
+    // Delete from that user message onwards
+    try {
+        await fetch('/api/history/messages', {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF() },
+            body: JSON.stringify({ user_message: userText }),
+        });
+
+        // Clear live state so we get a fresh turn
+        _completedTurns.clear();
+        _liveSegments = [];
+        _liveAccumulator = '';
+
+        // Re-stream the same message
+        const { triggerSendWithText } = await import('/static/handlers/send-handlers.js');
+        await triggerSendWithText(userText);
+    } catch (e) {
+        console.error('[PA] Regenerate failed:', e);
+    }
+}
+
 async function _sendChat() {
     const input = document.getElementById('pa-chat-input');
     if (!input) return;
@@ -1343,7 +1483,7 @@ function _updateLiveBubble() {
 
 function _getLeadName() {
     const label = document.getElementById('pa-lead-label');
-    return label?.textContent?.trim() || 'lexi';
+    return label?.textContent?.trim() || 'lead';
 }
 
 function _getLeadDisplayName() {
@@ -1359,7 +1499,7 @@ function _getLeadColor() {
 // ─── Thinking Orb ──────────────────────────────────────────────────────────
 
 let _orbState = 'idle'; // 'idle' | 'thinking' | 'nudge'
-let _aiTyping = false;  // true while Lexi (lead) is actively responding
+let _aiTyping = false;  // true while lead persona is actively responding
 
 function _setOrbState(state) {
     _orbState = state;
@@ -1376,10 +1516,10 @@ function _updateOrbFromTranscript(delTranscript, activeDelegates, chatMessages) 
     const stillRunning = activeDelegates.some(d => d.status === 'running');
 
     if (stillRunning || _aiTyping) {
-        // Delegates working or Lexi actively responding — spin
+        // Delegates working or lead actively responding — spin
         _setOrbState('thinking');
     } else if (_hasUnretrievedResults(delTranscript, chatMessages)) {
-        // Fallback: results exist but Lexi didn't summarize (e.g. timeout)
+        // Fallback: results exist but lead didn't summarize (e.g. timeout)
         _setOrbState('nudge');
     } else {
         _setOrbState('idle');
@@ -1387,12 +1527,12 @@ function _updateOrbFromTranscript(delTranscript, activeDelegates, chatMessages) 
 }
 
 function _hasUnretrievedResults(delTranscript, chatMessages) {
-    // Check if there are delegate results that Lexi hasn't addressed yet
+    // Check if there are delegate results that lead hasn't addressed yet
     // With synchronous delegation this should rarely happen — only on timeout/error
     const hasResults = delTranscript.some(e => e.type === 'result');
     if (!hasResults) return false;
 
-    // If Lexi's last message contains a summary (text content after delegation), she handled it
+    // If lead's last message contains a summary (text content after delegation), they handled it
     const lastAssistant = [...chatMessages].reverse().find(m => m.role === 'assistant');
     if (!lastAssistant) return true;
 
@@ -1423,17 +1563,31 @@ async function _orbNudge() {
 
 // ─── Bar TTS (Play/Stop last assistant message) ────────────────────────────
 
-let _barTtsPlayer = null;
+// _barTtsPlayer removed — replaced by _ttsPlaying + server-side playback
+
+let _ttsPlaying = false;  // Track server-side TTS state
+
+async function _stopTts() {
+    try {
+        await fetch('/api/tts/stop', {
+            method: 'POST',
+            headers: { 'X-CSRF-Token': CSRF() },
+        });
+    } catch (e) { /* ignore */ }
+    _ttsPlaying = false;
+    // Clear all TTS button states
+    document.querySelectorAll('.pa-tts-playing, .pa-tts-loading').forEach(el => {
+        el.classList.remove('pa-tts-playing', 'pa-tts-loading');
+    });
+}
 
 async function _toggleBarTts() {
     const btn = document.getElementById('pa-bar-tts');
     if (!btn) return;
 
     // If playing, stop
-    if (_barTtsPlayer) {
-        _barTtsPlayer.pause();
-        _barTtsPlayer = null;
-        btn.classList.remove('pa-tts-playing', 'pa-tts-loading');
+    if (_ttsPlaying) {
+        await _stopTts();
         return;
     }
 
@@ -1441,18 +1595,13 @@ async function _toggleBarTts() {
     const container = document.getElementById('pa-transcript');
     if (!container) return;
 
-    // Get last assistant bubble's text
     const bubbles = container.querySelectorAll('.pa-bubble-assistant .pa-chat-text');
     const lastBubble = bubbles.length ? bubbles[bubbles.length - 1] : null;
-
-    // Also check delegate results
     const results = container.querySelectorAll('.pa-msg-content');
     const lastResult = results.length ? results[results.length - 1] : null;
 
-    // Pick whichever comes last in the DOM
     let textEl = null;
     if (lastBubble && lastResult) {
-        // Compare DOM position
         const pos = lastBubble.compareDocumentPosition(lastResult);
         textEl = (pos & Node.DOCUMENT_POSITION_FOLLOWING) ? lastResult : lastBubble;
     } else {
@@ -1465,32 +1614,26 @@ async function _toggleBarTts() {
     btn.classList.add('pa-tts-loading');
 
     try {
-        const body = { text: text.substring(0, 3000) };
-        const resp = await fetch('/api/tts/speak', {
+        const resp = await fetch('/api/tts', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF() },
-            body: JSON.stringify(body),
+            body: JSON.stringify({ text: text.substring(0, 3000), output_mode: 'play' }),
         });
         if (!resp.ok) throw new Error(`TTS error: ${resp.status}`);
 
-        const blob = await resp.blob();
-        const url = URL.createObjectURL(blob);
-        _barTtsPlayer = new Audio(url);
-
         btn.classList.remove('pa-tts-loading');
         btn.classList.add('pa-tts-playing');
+        _ttsPlaying = true;
 
-        _barTtsPlayer.onended = () => {
-            btn.classList.remove('pa-tts-playing');
-            URL.revokeObjectURL(url);
-            _barTtsPlayer = null;
-        };
-        _barTtsPlayer.onerror = () => {
-            btn.classList.remove('pa-tts-playing');
-            URL.revokeObjectURL(url);
-            _barTtsPlayer = null;
-        };
-        _barTtsPlayer.play();
+        // Estimate duration and auto-clear (server-side playback has no end event)
+        const words = text.split(/\s+/).length;
+        const durationMs = Math.max(2000, (words / 150) * 60000);
+        setTimeout(() => {
+            if (_ttsPlaying) {
+                _ttsPlaying = false;
+                btn.classList.remove('pa-tts-playing');
+            }
+        }, durationMs);
     } catch (e) {
         btn.classList.remove('pa-tts-loading');
         console.error('[PA] Bar TTS failed:', e);
@@ -2319,6 +2462,22 @@ function _injectStyles() {
     line-height: 1.5; color: rgba(255,255,255,0.65); white-space: pre-wrap;
     word-break: break-word;
 }
+
+/* Message action buttons */
+.pa-msg-actions {
+    display: inline-flex; gap: 2px; margin-left: auto; opacity: 0;
+    transition: opacity 0.15s;
+}
+.pa-chat-bubble:hover .pa-msg-actions { opacity: 1; }
+.pa-action-btn {
+    background: none; border: 1px solid transparent; color: #555;
+    cursor: pointer; font-size: 0.72rem; padding: 2px 5px; border-radius: 4px;
+    transition: all 0.15s; line-height: 1;
+}
+.pa-action-btn:hover { color: #4a9eff; border-color: rgba(74,158,255,0.3); }
+.pa-delete-btn:hover { color: #ff5555; border-color: rgba(255,85,85,0.3); }
+.pa-tts-loading { color: #ff9800 !important; animation: pa-spin 1s linear infinite; }
+.pa-tts-playing { color: #4a9eff !important; animation: pa-pulse 1.2s ease-in-out infinite; }
 
 /* Thinking blocks */
 .pa-think-block {

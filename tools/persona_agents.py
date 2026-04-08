@@ -55,7 +55,7 @@ EMOJI = '\U0001f3ad'
 # with the streaming behavior so delegate results aren't lost.
 try:
     from core.continuity.execution_context import ExecutionContext as _EC
-    from core.continuity import config as _ec_config
+    import config as _ec_config
     from typing import List, Dict
 
     _original_run = _EC.run  # Keep reference for non-delegate usage
@@ -179,14 +179,14 @@ TOOLS = [
                 "This tool blocks until the agent finishes and returns their full report.\n"
                 "You do NOT need to call get_delegate_result afterwards — the result is returned directly.\n"
                 "After receiving the result, summarize the findings for the user in your own words.\n\n"
-                "Example: delegate_task(persona='sonic', task='Research the latest news on AI')"
+                "Example: delegate_task(persona='researcher', task='Research the latest news on AI')"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "persona": {
                         "type": "string",
-                        "description": "Name of the persona to delegate to (e.g. 'sonic', 'alfred'). Must be an existing persona."
+                        "description": "Name of the persona to delegate to (e.g. 'researcher', 'engineer'). Must be an existing persona."
                     },
                     "task": {
                         "type": "string",
@@ -730,7 +730,7 @@ def _delegate_task(arguments):
         pass
 
     # ── Synchronous wait — block until delegate finishes ──────────────────
-    # This keeps Lexi's tool-call loop alive so she gets the result directly
+    # This keeps the lead persona's tool-call loop alive so they get the result directly
     # without needing a nudge or get_delegate_result call.
     # SSE events still fire during the wait so the UI stays responsive.
     MAX_WAIT = 300  # 5 minute safety cap

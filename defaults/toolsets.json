@@ -1,0 +1,97 @@
+{
+  "_comment": "Recommended toolsets for Persona Agents. These are seeded into your user/toolsets/toolsets.json on first plugin load. You can edit or delete them freely after install.",
+  "pa_coordinator": {
+    "emoji": "\ud83c\udfaf",
+    "description": "Lead coordinator — delegates tasks, tracks goals, manages team",
+    "functions": [
+      "delegate_task",
+      "check_delegates",
+      "get_delegate_result",
+      "ask_claude",
+      "save_memory",
+      "search_memory",
+      "get_recent_memories",
+      "delete_memory",
+      "save_knowledge",
+      "search_knowledge",
+      "delete_knowledge",
+      "create_goal",
+      "list_goals",
+      "update_goal",
+      "delete_goal",
+      "notepad_read",
+      "notepad_append_lines",
+      "notepad_insert_line",
+      "notepad_delete_lines",
+      "get_time",
+      "list_tools",
+      "search_help_docs"
+    ]
+  },
+  "pa_researcher": {
+    "emoji": "\ud83d\udd0d",
+    "description": "Web researcher — searches, reads sites, investigates topics",
+    "functions": [
+      "web_search",
+      "get_website",
+      "get_wikipedia",
+      "research_topic",
+      "get_site_links",
+      "get_images",
+      "save_knowledge",
+      "search_knowledge",
+      "delete_knowledge",
+      "save_memory",
+      "search_memory",
+      "get_time",
+      "notepad_read",
+      "notepad_append_lines",
+      "notepad_insert_line",
+      "notepad_delete_lines"
+    ]
+  },
+  "pa_engineer": {
+    "emoji": "\u2699\ufe0f",
+    "description": "Engineer — runs commands, writes scripts, builds solutions",
+    "functions": [
+      "run_command",
+      "ask_claude",
+      "web_search",
+      "get_website",
+      "research_topic",
+      "get_site_links",
+      "notepad_read",
+      "notepad_append_lines",
+      "notepad_insert_line",
+      "notepad_delete_lines",
+      "save_knowledge",
+      "search_knowledge",
+      "delete_knowledge",
+      "search_memory",
+      "save_memory",
+      "get_time"
+    ]
+  },
+  "pa_sysadmin": {
+    "emoji": "\ud83d\udda5\ufe0f",
+    "description": "System admin — network diagnostics, commands, monitoring",
+    "functions": [
+      "run_command",
+      "check_internet",
+      "get_external_ip",
+      "website_status",
+      "web_search",
+      "get_website",
+      "notepad_read",
+      "notepad_append_lines",
+      "notepad_insert_line",
+      "notepad_delete_lines",
+      "save_memory",
+      "search_memory",
+      "get_recent_memories",
+      "get_time",
+      "list_tools",
+      "search_help_docs"
+    ]
+  }
+}
