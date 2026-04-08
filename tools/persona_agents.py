@@ -1,0 +1,824 @@
+# Persona Agents — delegate tasks to persona-powered specialists
+# Each agent runs with their persona's full prompt + a focused toolset
+# Results include character flair (in-character intro/outro)
+
+import json
+import logging
+import re
+import threading
+import time
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# Dedicated delegation log (auto-pruning file in user/logs/)
+# Plugin tools are exec()'d, not imported — use importlib path-based loading
+# Also register in sys.modules so routes/hooks can access via normal imports
+import sys as _sys
+import importlib.util as _ilu
+
+def _load_sibling_module(filename, module_name):
+    """Load a Python file from this plugin's directory and register in sys.modules."""
+    path = str(Path(__file__).parent.parent / filename)
+    spec = _ilu.spec_from_file_location(module_name, path)
+    mod = _ilu.module_from_spec(spec)
+    _sys.modules[module_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+try:
+    _dlog_mod = _load_sibling_module("delegation_log.py", "persona_agents_delegation_log")
+    log_dispatch = _dlog_mod.log_dispatch
+    log_tool_call = _dlog_mod.log_tool_call
+    log_result = _dlog_mod.log_result
+    log_batch_complete = _dlog_mod.log_batch_complete
+    log_event = _dlog_mod.log_event
+    _has_dlog = True
+except Exception as _e:
+    logger.warning(f"[PERSONA-AGENT] Delegation log unavailable: {_e}")
+    _has_dlog = False
+    def log_dispatch(*a, **kw): pass
+    def log_tool_call(*a, **kw): pass
+    def log_result(*a, **kw): pass
+    def log_batch_complete(*a, **kw): pass
+    def log_event(*a, **kw): pass
+
+ENABLED = True
+EMOJI = '\U0001f3ad'
+
+# ── Monkey-patch ExecutionContext.run() ──────────────────────────────────────
+# Core's run() calls filter_to_thinking_only() on tool-call rounds, which
+# strips all real content and keeps only <think> blocks. The streaming chat
+# does NOT do this — it preserves full content. This patch aligns run()
+# with the streaming behavior so delegate results aren't lost.
+try:
+    from core.continuity.execution_context import ExecutionContext as _EC
+    from core.continuity import config as _ec_config
+    from typing import List, Dict
+
+    _original_run = _EC.run  # Keep reference for non-delegate usage
+
+    def _patched_run(self, user_input: str, history_messages: List[Dict] = None) -> str:
+        """Patched run() that preserves content on tool-call rounds for delegates.
+        Non-delegate calls pass through to original run() unchanged."""
+        # Only apply fix when called from a delegate (marked by _persona_agent flag)
+        if not getattr(self, '_persona_agent', False):
+            return _original_run(self, user_input, history_messages)
+
+        from core.chat.chat import _inject_tool_images
+
+        if history_messages is not None:
+            messages = [{"role": "system", "content": self.system_prompt}] + history_messages
+            messages.append({"role": "user", "content": user_input})
+        else:
+            messages = [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": user_input}
+            ]
+
+        max_iterations = self.task_settings.get("max_tool_rounds") or _ec_config.MAX_TOOL_ITERATIONS
+        max_parallel = self.task_settings.get("max_parallel_tools") or _ec_config.MAX_PARALLEL_TOOLS
+        context_limit = self.task_settings.get("context_limit") or getattr(_ec_config, 'CONTEXT_LIMIT', 0)
+
+        final_content = None
+
+        for i in range(max_iterations):
+            if context_limit > 0:
+                from core.chat.history import count_tokens
+                total_tokens = sum(count_tokens(str(m.get("content", ""))) for m in messages)
+                if total_tokens > context_limit * 0.9:
+                    break
+
+            response_msg = self.tool_engine.call_llm_with_metrics(
+                self.provider, messages, self.gen_params, tools=self.tools
+            )
+
+            if response_msg.has_tool_calls:
+                # KEY FIX: preserve full content instead of filter_to_thinking_only
+                content = response_msg.content or ""
+                tool_calls = response_msg.get_tool_calls_as_dicts()[:max_parallel]
+                messages.append({
+                    "role": "assistant", "content": content,
+                    "tool_calls": tool_calls
+                })
+                # Track the content in case this is the last round
+                if content.strip():
+                    final_content = content
+                self.tool_log.extend(tc.get('function', {}).get('name', '?') for tc in tool_calls)
+                tools_executed, tool_images = self.tool_engine.execute_tool_calls(
+                    tool_calls, messages, None, self.provider, scopes=self.scopes,
+                    allowed_tools=self._allowed_tool_names
+                )
+                if tool_images:
+                    _inject_tool_images(messages, tool_images)
+                continue
+
+            elif response_msg.content:
+                fn_data = self.tool_engine.extract_function_call_from_text(response_msg.content)
+                if fn_data:
+                    self.tool_log.append(fn_data.get('name', '?'))
+                    content = response_msg.content
+                    _, tool_images = self.tool_engine.execute_text_based_tool_call(
+                        fn_data, content, messages, None, self.provider, scopes=self.scopes,
+                        allowed_tools=self._allowed_tool_names
+                    )
+                    if tool_images:
+                        _inject_tool_images(messages, tool_images)
+                    continue
+
+                final_content = response_msg.content
+                break
+            else:
+                break
+
+        # Fallback: scan backwards for the last assistant message with content
+        if final_content is None and messages:
+            for msg in reversed(messages):
+                if msg.get("role") == "assistant" and msg.get("content", "").strip():
+                    final_content = msg["content"]
+                    break
+
+        # If still nothing, compile tool results as a summary
+        if not final_content or not final_content.strip():
+            tool_results = []
+            for msg in messages:
+                if msg.get("role") == "tool" and msg.get("content"):
+                    tool_results.append(msg["content"])
+            if tool_results:
+                final_content = "\n\n".join(tool_results[-3:])  # Last 3 tool results
+
+        return final_content or ""
+
+    _EC.run = _patched_run
+    logger.info("[PERSONA-AGENT] Patched ExecutionContext.run() — scoped to delegate agents only")
+except Exception as _patch_err:
+    logger.warning(f"[PERSONA-AGENT] Failed to patch ExecutionContext.run(): {_patch_err}")
+    # Falls back to original behavior + raw fallback in _execute()
+
+AVAILABLE_FUNCTIONS = [
+    'delegate_task',
+    'check_delegates',
+    'get_delegate_result',
+]
+
+TOOLS = [
+    {
+        "type": "function",
+        "is_local": True,
+        "function": {
+            "name": "delegate_task",
+            "description": (
+                "Delegate a task to a persona-agent specialist and wait for their result.\n"
+                "The agent runs with the persona's full personality and a focused toolset.\n\n"
+                "The persona-agent will:\n"
+                "1. Acknowledge the task in character\n"
+                "2. Use their tools to complete it\n"
+                "3. Report back with results in character\n\n"
+                "This tool blocks until the agent finishes and returns their full report.\n"
+                "You do NOT need to call get_delegate_result afterwards — the result is returned directly.\n"
+                "After receiving the result, summarize the findings for the user in your own words.\n\n"
+                "Example: delegate_task(persona='sonic', task='Research the latest news on AI')"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "persona": {
+                        "type": "string",
+                        "description": "Name of the persona to delegate to (e.g. 'sonic', 'alfred'). Must be an existing persona."
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "Clear description of what you need them to do. Be specific — this is their only instruction."
+                    },
+                    "toolset": {
+                        "type": "string",
+                        "description": "Override toolset (optional). If empty, uses the persona's default toolset from their settings."
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Optional context from the current conversation to pass along (e.g. relevant data, user preferences)."
+                    }
+                },
+                "required": ["persona", "task"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "is_local": True,
+        "function": {
+            "name": "check_delegates",
+            "description": "Check the status of all active persona-agent delegates. Shows who's working, who's done, and what tools they used.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "is_local": True,
+        "function": {
+            "name": "get_delegate_result",
+            "description": "Get a completed persona-agent's report. Returns their in-character response with results. Auto-dismisses after retrieval.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "delegate_id": {
+                        "type": "string",
+                        "description": "The delegate's ID (from delegate_task or check_delegates)"
+                    }
+                },
+                "required": ["delegate_id"]
+            }
+        }
+    },
+]
+
+
+# ── Session & Delegate Storage ───────────────────────────────────────────────
+# Shared state — registered in sys.modules so routes (exec()'d separately) can access it
+
+_delegates = {}        # id -> PersonaDelegate
+_sessions = {}         # chat_name -> session dict (transcript for visual panel)
+_lock = threading.Lock()
+
+# Persistence — save session transcripts so they survive restarts
+_STATE_FILE = Path(__file__).parent.parent.parent.parent / 'user' / 'plugin_state' / 'persona-agents.json'
+
+
+def _save_sessions():
+    """Persist session transcripts to disk."""
+    try:
+        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with _lock:
+            data = {'sessions': _sessions}
+        _STATE_FILE.write_text(json.dumps(data, default=str), encoding='utf-8')
+    except Exception as e:
+        logger.debug(f"[PERSONA-AGENT] Failed to save sessions: {e}")
+
+
+def _load_sessions():
+    """Restore session transcripts from disk on startup."""
+    try:
+        if _STATE_FILE.exists():
+            data = json.loads(_STATE_FILE.read_text(encoding='utf-8'))
+            restored = data.get('sessions', {})
+            _sessions.update(restored)
+            logger.info(f"[PERSONA-AGENT] Restored {len(restored)} session(s) from disk")
+    except Exception as e:
+        logger.warning(f"[PERSONA-AGENT] Failed to load sessions: {e}")
+
+
+# Load saved sessions on module init
+_load_sessions()
+
+# Create a lightweight module for shared state access from routes
+import types as _types
+_shared = _types.ModuleType("persona_agents_shared")
+_shared._delegates = _delegates
+_shared._sessions = _sessions
+_shared._lock = _lock
+_sys.modules["persona_agents_shared"] = _shared
+
+
+def _strip_thinking(text):
+    """Remove thinking tags from LLM output."""
+    if not text:
+        return ''
+    result = re.sub(r'<think>[\s\S]*?</think>\s*', '', text)
+    result = re.sub(r'<\|channel>thought[\s\S]*?(?=<\|channel>|$)', '', result)
+    result = re.sub(r'</?think>\s*', '', result)
+    return result.strip()
+
+
+class PersonaDelegate:
+    """A persona-powered background agent."""
+
+    def __init__(self, delegate_id, persona_name, persona_data, task, toolset,
+                 context, chat_name, on_complete=None):
+        self.id = delegate_id
+        self.persona_name = persona_name
+        self.persona_data = persona_data
+        self.task = task
+        self.toolset = toolset
+        self.context = context
+        self.chat_name = chat_name
+        self.status = 'running'  # running | done | failed
+        self.result = None
+        self.error = None
+        self.tool_log = []
+        self.start_time = time.time()
+        self.end_time = None
+        self._thread = None
+        self._on_complete = on_complete
+
+        # Persona visual info
+        settings = persona_data.get('settings', {})
+        self.display_name = persona_data.get('name', persona_name)
+        self.trim_color = settings.get('trim_color', '#4a9eff')
+        self.voice = settings.get('voice', '')
+        self.pitch = settings.get('pitch', 1.0)
+        self.speed = settings.get('speed', 1.0)
+        self.avatar = persona_data.get('avatar')
+        self.tagline = persona_data.get('tagline', '')
+
+    @property
+    def elapsed(self):
+        end = self.end_time or time.time()
+        return round(end - self.start_time, 1)
+
+    def start(self):
+        self._thread = threading.Thread(
+            target=self._run, daemon=True,
+            name=f'persona-agent-{self.persona_name}-{self.id}'
+        )
+        self._thread.start()
+
+    def _run(self):
+        try:
+            self._execute()
+            self.status = 'done'
+        except Exception as e:
+            logger.error(f"[PERSONA-AGENT] {self.persona_name} failed: {e}", exc_info=True)
+            self.status = 'failed'
+            self.error = str(e)
+        finally:
+            self.end_time = time.time()
+            # Log result to dedicated log
+            log_result(
+                delegate_id=self.id,
+                persona=self.persona_name,
+                display_name=self.display_name,
+                status=self.status,
+                elapsed=self.elapsed,
+                tool_log=self.tool_log,
+                result_preview=self.result or '',
+                error=self.error or '',
+            )
+            # Add result to visual session
+            _add_to_session(self)
+            # Publish completion event for reactive UI
+            try:
+                from core.event_bus import publish
+                publish('delegate_completed', {
+                    'id': self.id,
+                    'persona': self.persona_name,
+                    'display_name': self.display_name,
+                    'status': self.status,
+                    'elapsed': self.elapsed,
+                    'tool_log': self.tool_log,
+                    'trim_color': self.trim_color,
+                    'chat_name': self.chat_name,
+                })
+            except Exception:
+                pass
+            # Notify batch complete
+            if self._on_complete:
+                try:
+                    self._on_complete(self.id, self.chat_name)
+                except Exception:
+                    pass
+
+    def _execute(self):
+        """Run the persona's task using ExecutionContext."""
+        from core.continuity.execution_context import ExecutionContext
+        from core.api_fastapi import get_system
+
+        system = get_system()
+        fm = system.llm_chat.function_manager
+        te = system.llm_chat.tool_engine
+
+        # Load the persona's prompt
+        settings = self.persona_data.get('settings', {})
+        prompt_name = settings.get('prompt', 'sapphire')
+
+        # Determine provider from persona settings
+        provider_key = settings.get('llm_primary', 'auto')
+        model_override = settings.get('llm_model', '')
+
+        # Build task settings — delegates use minimal scopes to stay within
+        # context limits. They're doing a focused task, not a full conversation.
+        task_settings = {
+            'prompt': prompt_name,
+            'toolset': self.toolset,
+            'provider': provider_key if provider_key != 'auto' else 'auto',
+            'model': model_override,
+            'max_tool_rounds': 10,
+            'max_parallel_tools': 3,
+            'inject_datetime': True,
+            'memory_scope': 'none',
+            'knowledge_scope': 'none',
+            'goal_scope': 'none',
+            'email_scope': 'none',
+            'bitcoin_scope': 'none',
+            'gcal_scope': 'none',
+            'telegram_scope': 'none',
+            'discord_scope': 'none',
+        }
+
+        ctx = ExecutionContext(fm, te, task_settings)
+        ctx._persona_agent = True  # Flag for patched run() to preserve content
+
+        # Build the delegation prompt — tells the persona they've been called in
+        delegation_prompt = (
+            f"[Team Delegation]\n"
+            f"You've been called in to help with a task. You are {self.display_name}.\n"
+            f"Stay fully in character. Start with a brief in-character acknowledgment "
+            f"(1-2 sentences showing your personality).\n"
+            f"Then do the actual work using your available tools.\n"
+            f"When done, give your results followed by a brief in-character sign-off.\n\n"
+            f"TASK: {self.task}"
+        )
+        if self.context:
+            delegation_prompt += f"\n\nCONTEXT: {self.context}"
+
+        log_event("EXEC", f"{self.persona_name} starting execution (toolset={self.toolset}, provider={provider_key})")
+
+        raw = ctx.run(delegation_prompt)
+
+        logger.info(f"[PERSONA-AGENT] {self.persona_name} raw result type={type(raw).__name__}, "
+                     f"len={len(raw) if raw else 0}, preview={repr((raw or '')[:200])}")
+
+        self.tool_log = ctx.tool_log
+
+        # Try to strip thinking tags, but if that empties the result,
+        # keep the raw content — better to show thinking than "(No result)"
+        result = _strip_thinking(raw) if raw else ''
+        if not result and raw and raw.strip():
+            logger.info(f"[PERSONA-AGENT] {self.persona_name} think-stripping emptied result, "
+                        f"keeping raw content (len={len(raw)})")
+            result = raw.strip()
+
+        self.result = result or None  # None = no result, '' would be falsy ambiguity
+
+        # Log each tool that was called
+        for tool_name in self.tool_log:
+            log_tool_call(self.id, self.persona_name, tool_name)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'persona': self.persona_name,
+            'display_name': self.display_name,
+            'task': self.task,
+            'status': self.status,
+            'elapsed': self.elapsed,
+            'tool_log': self.tool_log,
+            'trim_color': self.trim_color,
+            'avatar': self.avatar,
+            'tagline': self.tagline,
+            'voice': self.voice,
+            'pitch': self.pitch,
+            'speed': self.speed,
+            'has_result': self.result is not None,
+            'error': self.error,
+        }
+
+
+# ── Visual Session (Round Table style transcript) ────────────────────────────
+
+def _get_session(chat_name):
+    """Get or create a visual session for this chat."""
+    if chat_name not in _sessions:
+        _sessions[chat_name] = {
+            'id': uuid.uuid4().hex[:8],
+            'chat_name': chat_name,
+            'transcript': [],
+            'created_at': datetime.now().isoformat(),
+        }
+    return _sessions[chat_name]
+
+
+def _add_to_session(delegate):
+    """Add a delegate's result to the visual transcript."""
+    session = _get_session(delegate.chat_name)
+
+    # Dispatch entry
+    entry = {
+        'type': 'dispatch',
+        'persona': delegate.persona_name,
+        'display_name': delegate.display_name,
+        'task': delegate.task,
+        'trim_color': delegate.trim_color,
+        'avatar': delegate.avatar,
+        'timestamp': datetime.fromtimestamp(delegate.start_time).isoformat(),
+    }
+    # Only add dispatch if not already there
+    if not any(e.get('type') == 'dispatch' and e.get('persona') == delegate.persona_name
+               and e.get('task') == delegate.task for e in session['transcript']):
+        session['transcript'].append(entry)
+
+    # Result entry
+    result_entry = {
+        'type': 'result',
+        'persona': delegate.persona_name,
+        'display_name': delegate.display_name,
+        'status': delegate.status,
+        'content': delegate.result if delegate.result is not None and delegate.result != '' else (delegate.error or '(No result)'),
+        'tool_log': delegate.tool_log,
+        'elapsed': delegate.elapsed,
+        'trim_color': delegate.trim_color,
+        'avatar': delegate.avatar,
+        'voice': delegate.voice,
+        'pitch': delegate.pitch,
+        'speed': delegate.speed,
+        'timestamp': datetime.now().isoformat(),
+    }
+    session['transcript'].append(result_entry)
+
+    # Persist to disk so transcripts survive restarts
+    _save_sessions()
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _get_active_chat():
+    """Get the current active chat name."""
+    try:
+        from core.api_fastapi import get_system
+        return get_system().llm_chat.get_active_chat() or 'default'
+    except Exception:
+        return 'default'
+
+
+def _load_persona(persona_name):
+    """Load a persona's full data."""
+    try:
+        from core.personas.persona_manager import persona_manager
+        return persona_manager.get(persona_name)
+    except Exception as e:
+        logger.error(f"[PERSONA-AGENT] Failed to load persona '{persona_name}': {e}")
+        return None
+
+
+def _list_all_personas():
+    """List all available persona names."""
+    try:
+        from core.personas.persona_manager import persona_manager
+        return list(persona_manager.get_all().keys())
+    except Exception:
+        return []
+
+
+def _check_batch_complete(delegate_id, chat_name):
+    """Called when a delegate finishes. Logs completion.
+
+    In Manual mode: notification to the lead persona happens via prompt_inject
+    hook on the next user message.
+    In Auto mode: backend sends a continuation message to trigger the lead
+    persona to pick up results and keep going.
+    """
+    with _lock:
+        chat_delegates = [d for d in _delegates.values() if d.chat_name == chat_name]
+        if not chat_delegates:
+            return
+        still_running = any(d.status == 'running' for d in chat_delegates)
+
+    log_batch_complete(chat_name, len(chat_delegates))
+
+    # Auto-continue: if enabled and no delegates still running, nudge from backend
+    # This covers both browser and headless (scheduled tasks) scenarios
+    if not still_running and getattr(_shared, '_auto_continue', False):
+        # Debounce — wait briefly in case multiple delegates finish near-simultaneously
+        threading.Timer(2.0, _backend_nudge, args=[chat_name]).start()
+
+
+_nudge_pending = {}  # chat_name -> True if a nudge is already scheduled
+
+def _backend_nudge(chat_name):
+    """Send a continuation message to trigger the lead persona to pick up results."""
+    # Prevent double nudges
+    if _nudge_pending.get(chat_name):
+        return
+    _nudge_pending[chat_name] = True
+
+    try:
+        from core.api_fastapi import get_system
+        import asyncio
+
+        system = get_system()
+        msg = "[Delegate reports are ready — review results and continue your task]"
+
+        # Use the streaming chat to send and get a response
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            async def _do_nudge():
+                try:
+                    await system.llm_chat.streaming_chat.send_and_stream(
+                        msg, chat_name=chat_name,
+                    )
+                finally:
+                    _nudge_pending.pop(chat_name, None)
+            loop.create_task(_do_nudge())
+        else:
+            _nudge_pending.pop(chat_name, None)
+
+        log_event("AUTO-CONTINUE", f"Backend nudge sent for chat={chat_name}")
+    except Exception as e:
+        _nudge_pending.pop(chat_name, None)
+        log_event("AUTO-CONTINUE-ERR", f"Backend nudge failed: {e}")
+
+
+# ── Tool Execution ───────────────────────────────────────────────────────────
+
+def execute(function_name, arguments, config, plugin_settings=None):
+
+    if function_name == 'delegate_task':
+        return _delegate_task(arguments)
+
+    elif function_name == 'check_delegates':
+        return _check_delegates()
+
+    elif function_name == 'get_delegate_result':
+        return _get_delegate_result(arguments)
+
+    return f"Unknown function: {function_name}", False
+
+
+def _delegate_task(arguments):
+    """Spawn a persona-powered agent to handle a task."""
+    persona_name = arguments.get('persona', '').strip().lower()
+    task = arguments.get('task', '').strip()
+    toolset_override = arguments.get('toolset', '').strip()
+    context = arguments.get('context', '').strip()
+
+    if not persona_name:
+        available = ', '.join(_list_all_personas())
+        return f"ERROR: persona name is required. Available personas: {available}", False
+
+    if not task:
+        return "ERROR: task description is required.", False
+
+    # Load persona
+    persona_data = _load_persona(persona_name)
+    if not persona_data:
+        available = ', '.join(_list_all_personas())
+        return (
+            f"ERROR: Persona '{persona_name}' not found. "
+            f"Available personas: {available}",
+            False
+        )
+
+    # Determine toolset: override > persona setting > fallback to 'conversation'
+    settings = persona_data.get('settings', {})
+    toolset = toolset_override or settings.get('toolset', '') or 'conversation'
+
+    # Check concurrent limit
+    with _lock:
+        active_count = sum(1 for d in _delegates.values() if d.status == 'running')
+        if active_count >= 3:
+            return "ERROR: Maximum 3 delegates can run at once. Wait for one to finish or check results.", False
+
+        delegate_id = uuid.uuid4().hex[:8]
+        chat_name = _get_active_chat()
+
+        delegate = PersonaDelegate(
+            delegate_id=delegate_id,
+            persona_name=persona_name,
+            persona_data=persona_data,
+            task=task,
+            toolset=toolset,
+            context=context,
+            chat_name=chat_name,
+            on_complete=_check_batch_complete,
+        )
+        _delegates[delegate_id] = delegate
+
+    # Add dispatch notice to visual session
+    session = _get_session(chat_name)
+    session['transcript'].append({
+        'type': 'dispatch',
+        'persona': persona_name,
+        'display_name': delegate.display_name,
+        'task': task,
+        'toolset': toolset,
+        'trim_color': delegate.trim_color,
+        'avatar': delegate.avatar,
+        'timestamp': datetime.now().isoformat(),
+    })
+    _save_sessions()
+
+    delegate.start()
+
+    logger.info(f"[PERSONA-AGENT] Delegated to {persona_name} (id={delegate_id}, toolset={toolset}): {task[:80]}")
+    log_dispatch(
+        delegate_id=delegate_id,
+        persona=persona_name,
+        display_name=delegate.display_name,
+        task=task,
+        toolset=toolset,
+        chat_name=chat_name,
+    )
+
+    # Publish dispatch event for reactive UI
+    try:
+        from core.event_bus import publish
+        publish('delegate_dispatched', {
+            'id': delegate_id,
+            'persona': persona_name,
+            'display_name': delegate.display_name,
+            'task': task,
+            'toolset': toolset,
+            'trim_color': delegate.trim_color,
+            'chat_name': chat_name,
+        })
+    except Exception:
+        pass
+
+    # ── Synchronous wait — block until delegate finishes ──────────────────
+    # This keeps Lexi's tool-call loop alive so she gets the result directly
+    # without needing a nudge or get_delegate_result call.
+    # SSE events still fire during the wait so the UI stays responsive.
+    MAX_WAIT = 300  # 5 minute safety cap
+    poll_interval = 0.5
+    waited = 0.0
+    while delegate.status == 'running' and waited < MAX_WAIT:
+        time.sleep(poll_interval)
+        waited += poll_interval
+
+    if delegate.status == 'running':
+        # Timed out — fall back to async mode
+        return (
+            f"{delegate.display_name} is still working (>{MAX_WAIT}s elapsed).\n"
+            f"Use check_delegates to monitor, then get_delegate_result when done.",
+            True
+        )
+
+    # Delegate finished — return the full result directly
+    tools_used = ', '.join(delegate.tool_log) if delegate.tool_log else 'none'
+    result = delegate.result or delegate.error or '(No result)'
+
+    logger.info(f"[PERSONA-AGENT] Synchronous return for {delegate.display_name}: "
+                f"status={delegate.status}, result_len={len(result)}, "
+                f"result_preview={repr(result[:150])}")
+
+    # Clean up the delegate from the active pool
+    with _lock:
+        _delegates.pop(delegate_id, None)
+
+    status_icon = '✅' if delegate.status == 'done' else '❌'
+    return (
+        f"{status_icon} {delegate.display_name} — {delegate.status} in {delegate.elapsed}s | tools: {tools_used}\n\n"
+        f"{result}",
+        True
+    )
+
+
+def _check_delegates():
+    """Check status of all persona delegates."""
+    chat_name = _get_active_chat()
+    with _lock:
+        delegates = [d for d in _delegates.values() if d.chat_name == chat_name]
+
+    if not delegates:
+        return "No active persona delegates.", True
+
+    lines = [f"Persona Delegates ({len(delegates)}):"]
+    for d in delegates:
+        icon = {
+            'running': '\U0001f7e1', 'done': '\U0001f7e2', 'failed': '\U0001f534'
+        }.get(d.status, '\u2753')
+        lines.append(f"  {icon} {d.display_name} [{d.id}] \u2014 {d.status} ({d.elapsed}s)")
+        lines.append(f"      Task: {d.task[:100]}")
+        lines.append(f"      Toolset: {d.toolset}")
+        if d.tool_log:
+            lines.append(f"      Tools used: {', '.join(d.tool_log)}")
+
+    return '\n'.join(lines), True
+
+
+def _get_delegate_result(arguments):
+    """Get a completed delegate's report and dismiss them."""
+    delegate_id = arguments.get('delegate_id', '').strip()
+    if not delegate_id:
+        return "ERROR: delegate_id is required.", False
+
+    with _lock:
+        delegate = _delegates.get(delegate_id)
+
+    if not delegate:
+        return f"ERROR: Delegate '{delegate_id}' not found.", False
+
+    if delegate.status == 'running':
+        return (
+            f"{delegate.display_name} is still working on it ({delegate.elapsed}s elapsed).\n"
+            f"Tools used so far: {', '.join(delegate.tool_log) if delegate.tool_log else 'none yet'}",
+            True
+        )
+
+    # Get result and clean up
+    tools_used = ', '.join(delegate.tool_log) if delegate.tool_log else 'none'
+    result = delegate.result or delegate.error or 'No result.'
+
+    with _lock:
+        _delegates.pop(delegate_id, None)
+
+    return (
+        f"[{delegate.display_name} \u2014 {delegate.status} in {delegate.elapsed}s | tools: {tools_used}]\n\n"
+        f"{result}",
+        True
+    )

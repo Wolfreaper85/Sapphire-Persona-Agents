@@ -1,0 +1,60 @@
+{
+    "name": "persona-agents",
+    "version": "1.0.0",
+    "description": "Persona Agents — Delegate tasks to persona-powered specialists. Each agent uses their persona's personality, voice, and focused toolset. Visual delegation chain with character flair.",
+    "author": "Wolfreaper85 & Claude",
+    "icon": "\ud83c\udfad",
+    "default_enabled": true,
+    "priority": 55,
+    "capabilities": {
+        "tools": [
+            "tools/persona_agents.py"
+        ],
+        "hooks": {
+            "prompt_inject": "hooks/prompt_inject.py"
+        },
+        "web": true,
+        "routes": [
+            {
+                "method": "GET",
+                "path": "personas",
+                "handler": "routes/delegation.py:get_available_personas"
+            },
+            {
+                "method": "GET",
+                "path": "sessions",
+                "handler": "routes/delegation.py:list_sessions"
+            },
+            {
+                "method": "GET",
+                "path": "session",
+                "handler": "routes/delegation.py:get_session"
+            },
+            {
+                "method": "POST",
+                "path": "session/clear",
+                "handler": "routes/delegation.py:clear_session"
+            },
+            {
+                "method": "GET",
+                "path": "log",
+                "handler": "routes/delegation.py:get_delegation_log"
+            },
+            {
+                "method": "GET",
+                "path": "log/stats",
+                "handler": "routes/delegation.py:get_log_stats"
+            },
+            {
+                "method": "GET",
+                "path": "settings",
+                "handler": "routes/delegation.py:get_settings"
+            },
+            {
+                "method": "POST",
+                "path": "settings",
+                "handler": "routes/delegation.py:save_settings"
+            }
+        ]
+    }
+}
