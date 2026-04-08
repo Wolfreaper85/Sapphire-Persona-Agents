@@ -6,10 +6,14 @@ prompt_inject hook — Injects two things into the system prompt:
 Designed to work for ANY user's persona/toolset setup — no hardcoded names.
 """
 
+import json as _json
 import sys as _sys
 import logging
+from pathlib import Path as _Path
 
 logger = logging.getLogger(__name__)
+
+_TEAMS_FILE = _Path(__file__).parent.parent.parent.parent / 'user' / 'plugin_state' / 'persona-teams.json'
 
 MAX_ROSTER_ENTRIES = 15
 
@@ -69,9 +73,31 @@ _TASK_SIGNALS = {
     'youtube':      {'get_youtube_transcript', 'web_search', 'get_website'},
     'news':         {'web_search', 'research_topic'},
     'headline':     {'web_search', 'research_topic'},
-    'weather':      {'web_search'},
-    'price':        {'web_search'},
-    'stock':        {'web_search'},
+    'weather':      {'web_search', 'get_website'},
+    # ── Finance / Investing ──
+    'stock':        {'web_search', 'get_website', 'research_topic'},
+    'stocks':       {'web_search', 'get_website', 'research_topic'},
+    'price':        {'web_search', 'get_website'},
+    'dividend':     {'web_search', 'get_website', 'research_topic', 'save_knowledge'},
+    'dividends':    {'web_search', 'get_website', 'research_topic', 'save_knowledge'},
+    'earnings':     {'web_search', 'get_website', 'research_topic', 'save_knowledge'},
+    'portfolio':    {'web_search', 'get_website', 'research_topic', 'save_knowledge'},
+    'income':       {'web_search', 'get_website', 'research_topic', 'save_knowledge'},
+    'yield':        {'web_search', 'get_website', 'research_topic'},
+    'etf':          {'web_search', 'get_website', 'research_topic'},
+    'reit':         {'web_search', 'get_website', 'research_topic'},
+    'ticker':       {'web_search', 'get_website'},
+    'market':       {'web_search', 'get_website', 'research_topic'},
+    'treasury':     {'web_search', 'get_website', 'research_topic'},
+    'fed':          {'web_search', 'get_website', 'research_topic'},
+    'nav':          {'web_search', 'get_website', 'research_topic'},
+    'ex-date':      {'web_search', 'get_website'},
+    'ex-dividend':  {'web_search', 'get_website'},
+    'distribution': {'web_search', 'get_website', 'research_topic'},
+    'payout':       {'web_search', 'get_website'},
+    'invest':       {'web_search', 'get_website', 'research_topic'},
+    'crypto':       {'web_search', 'get_website'},
+    'bitcoin':      {'web_search', 'get_website'},
     'review':       {'web_search', 'get_website', 'research_topic'},
     'compare':      {'web_search', 'research_topic'},
     'what is':      {'web_search', 'get_wikipedia'},
@@ -219,6 +245,28 @@ def _score_persona_for_task(tool_names, user_message):
     return score, matched, needed_tools
 
 
+def _load_active_team_filter():
+    """Load the active team's member list. Returns None if 'All Hands' (no filter)."""
+    try:
+        if not _TEAMS_FILE.exists():
+            return None
+        with open(_TEAMS_FILE, 'r', encoding='utf-8') as f:
+            data = _json.load(f)
+        active = data.get('active_team', 'all-hands')
+        if active == 'all-hands':
+            return None
+        team = data.get('teams', {}).get(active)
+        if not team:
+            return None
+        members = team.get('members', {})
+        # Return set of enabled persona names
+        enabled = {name for name, on in members.items() if on}
+        return enabled if enabled else None
+    except Exception as e:
+        logger.debug(f"Team filter load failed: {e}")
+        return None
+
+
 def _is_task_capable(tool_names):
     """Check if a toolset has any real task-execution functions (not just chat/memory)."""
     return bool(set(tool_names) & _TASK_FUNCTIONS)
@@ -279,10 +327,15 @@ def _inject_roster(event):
         logger.debug("No personas found, skipping roster")
         return
 
-    # Only inject if the active persona is a coordinator (has delegate_task)
-    if active_tools and not _is_coordinator(active_tools):
-        logger.debug(f"Skipping roster — {active_persona!r} is not a coordinator")
-        return
+    # Dynamic delegation: every active persona gets delegation tools injected
+    # by the pre_chat hook, so we always inject the roster regardless of toolset.
+    # The old coordinator gate is removed — any persona can now delegate.
+
+    # ── Team filter ─────────────────────────────────────────────────────────
+    # If an active team is set (not "All Hands"), only show team members
+    _team_filter = _load_active_team_filter()
+    if _team_filter is not None:
+        logger.info(f"[TEAM-FILTER] Active team has {len(_team_filter)} members: {', '.join(sorted(_team_filter))}")
 
     # ── Score every persona against the user's message ──────────────────────
     specialists = []   # (score, name, line, matched_tools)
@@ -292,6 +345,9 @@ def _inject_roster(event):
         if not isinstance(p, dict):
             continue
         if name == active_persona:
+            continue
+        # Skip personas not on the active team
+        if _team_filter is not None and name not in _team_filter:
             continue
 
         settings = p.get("settings", {})
@@ -358,11 +414,26 @@ def _inject_roster(event):
     else:
         recommend = ""
 
+    # Detect if the active persona is a dedicated coordinator or a specialist with delegation
+    is_dedicated_coordinator = _is_coordinator(active_tools)
+
+    if is_dedicated_coordinator:
+        lead_intro = (
+            "You are a LEAD COORDINATOR. You do NOT do tasks yourself — you DELEGATE.\n"
+            "ALWAYS delegate to the persona whose tools BEST match the task.\n"
+        )
+    else:
+        lead_intro = (
+            "You have a TEAM of specialist agents you can delegate tasks to.\n"
+            "If the task needs skills or tools you don't have, DELEGATE to the best-matched agent.\n"
+            "If it's something YOU can handle with your own tools, do it yourself — no need to delegate.\n"
+            "You can also delegate SUB-TASKS while handling other parts yourself.\n"
+        )
+
     injection = (
         "[Persona Agents — Your Team]\n"
-        "You are a LEAD COORDINATOR. You do NOT do tasks yourself — you DELEGATE.\n"
-        "ALWAYS delegate to the persona whose tools BEST match the task.\n"
-        "The roster below is SORTED by relevance to the current request — prefer the top entries.\n\n"
+        + lead_intro
+        + "The roster below is SORTED by relevance to the current request — prefer the top entries.\n\n"
         + "\n".join(roster_lines) + "\n"
         + recommend + "\n"
         "DELEGATION RULES:\n"

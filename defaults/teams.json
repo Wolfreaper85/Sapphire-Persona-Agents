@@ -1,0 +1,12 @@
+{
+  "_comment": "Default teams for Persona Agents. Seeded on first install. Edit freely after.",
+  "active_team": "all-hands",
+  "teams": {
+    "all-hands": {
+      "name": "All Hands",
+      "description": "Every persona in the system",
+      "builtin": true,
+      "members": {}
+    }
+  }
+}

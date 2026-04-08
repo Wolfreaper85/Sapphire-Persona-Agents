@@ -12,6 +12,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 _STATE_FILE = Path(__file__).parent.parent.parent.parent / 'user' / 'plugin_state' / 'persona-agents.json'
+_TEAMS_FILE = Path(__file__).parent.parent.parent.parent / 'user' / 'plugin_state' / 'persona-teams.json'
 
 
 def _persist_sessions(shared):
@@ -274,3 +275,102 @@ async def list_skills(**kwargs):
             return {"skills": {}, "error": str(e)}
 
     return {"skills": mod.list_all_skills()}
+
+
+# ── Teams (team management for roster filtering) ─────────────────────────
+
+def _load_teams():
+    """Load teams from disk. Returns default structure if file missing."""
+    if _TEAMS_FILE.exists():
+        try:
+            with open(_TEAMS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load teams: {e}")
+    return {
+        "active_team": "all-hands",
+        "teams": {
+            "all-hands": {
+                "name": "All Hands",
+                "description": "Every persona in the system",
+                "builtin": True,
+                "members": {}
+            }
+        }
+    }
+
+
+def _save_teams(data):
+    """Save teams to disk."""
+    _TEAMS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(_TEAMS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+async def get_teams(**kwargs):
+    """Return full teams data."""
+    return _load_teams()
+
+
+async def save_teams(**kwargs):
+    """Save full teams data (create/edit/delete teams)."""
+    body = kwargs.get("body", {})
+
+    # Validate structure
+    if "teams" not in body or "active_team" not in body:
+        return {"success": False, "error": "Must include 'teams' and 'active_team'"}
+
+    # Ensure all-hands always exists
+    if "all-hands" not in body["teams"]:
+        body["teams"]["all-hands"] = {
+            "name": "All Hands",
+            "description": "Every persona in the system",
+            "builtin": True,
+            "members": {}
+        }
+
+    _save_teams(body)
+    return {"success": True}
+
+
+async def set_active_team(**kwargs):
+    """Switch the active team (fast path for dropdown)."""
+    body = kwargs.get("body", {})
+    team_key = body.get("team", "").strip()
+
+    if not team_key:
+        return {"success": False, "error": "team parameter required"}
+
+    data = _load_teams()
+
+    if team_key not in data["teams"]:
+        return {"success": False, "error": f"Team '{team_key}' not found"}
+
+    data["active_team"] = team_key
+    _save_teams(data)
+    logger.info(f"[PERSONA-AGENTS] Active team set to: {team_key}")
+    return {"success": True, "active_team": team_key}
+
+
+async def toggle_team_member(**kwargs):
+    """Toggle a single persona on/off within a team."""
+    body = kwargs.get("body", {})
+    team_key = body.get("team", "").strip()
+    persona = body.get("persona", "").strip()
+    enabled = body.get("enabled", True)
+
+    if not team_key or not persona:
+        return {"success": False, "error": "team and persona parameters required"}
+
+    data = _load_teams()
+    team = data["teams"].get(team_key)
+
+    if not team:
+        return {"success": False, "error": f"Team '{team_key}' not found"}
+
+    if team_key == "all-hands":
+        return {"success": False, "error": "Cannot toggle members in All Hands"}
+
+    team["members"][persona] = bool(enabled)
+    _save_teams(data)
+    return {"success": True, "team": team_key, "persona": persona, "enabled": bool(enabled)}

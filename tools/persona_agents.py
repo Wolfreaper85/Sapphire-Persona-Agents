@@ -740,7 +740,12 @@ class PersonaDelegate:
             f"- NEVER invent timestamps, quotes, summaries, or data you didn't actually retrieve.\n"
             f"- 'I couldn't access this' is ALWAYS better than a made-up answer.\n"
             f"- If a tool returns an error or empty result, report what happened honestly.\n"
-            f"- Partial info is fine — just label what's confirmed vs what you couldn't verify.\n"
+            f"- Partial info is fine — just label what's confirmed vs what you couldn't verify.\n\n"
+            f"⚠️ CRITICAL — ALWAYS PRODUCE VISIBLE OUTPUT:\n"
+            f"- Your response MUST contain visible text outside of <think> tags.\n"
+            f"- After thinking, you MUST write your report/answer as plain visible text.\n"
+            f"- If your entire response is inside <think> tags, your lead will see NOTHING.\n"
+            f"- Even if results are incomplete, write what you found as visible text.\n"
         )
 
         # Self-awareness: tell the delegate what tools they have

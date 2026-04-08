@@ -1,6 +1,6 @@
 {
     "name": "persona-agents",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "description": "Persona Agents — Delegate tasks to persona-powered specialists. Each agent uses their persona's personality, voice, and focused toolset. Visual delegation chain with character flair.",
     "author": "Wolfreaper85 & Claude",
     "icon": "\ud83c\udfad",
@@ -15,6 +15,7 @@
             "tools/youtube_transcript.py"
         ],
         "hooks": {
+            "pre_chat": "hooks/pre_chat.py",
             "prompt_inject": "hooks/prompt_inject.py"
         },
         "web": true,
@@ -58,6 +59,26 @@
                 "method": "POST",
                 "path": "settings",
                 "handler": "routes/delegation.py:save_settings"
+            },
+            {
+                "method": "GET",
+                "path": "teams",
+                "handler": "routes/delegation.py:get_teams"
+            },
+            {
+                "method": "POST",
+                "path": "teams",
+                "handler": "routes/delegation.py:save_teams"
+            },
+            {
+                "method": "POST",
+                "path": "teams/active",
+                "handler": "routes/delegation.py:set_active_team"
+            },
+            {
+                "method": "POST",
+                "path": "teams/toggle",
+                "handler": "routes/delegation.py:toggle_team_member"
             },
             {
                 "method": "GET",

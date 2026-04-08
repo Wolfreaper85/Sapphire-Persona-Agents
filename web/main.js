@@ -45,6 +45,9 @@ let _viewVisible = false;
 let _unsubscribers = [];         // Event listener cleanup
 let _autoContinue = false;       // When ON, auto-nudge lead persona after delegate completes
 let _userAvatarUrl = '/static/users/user.webp';  // Fallback default
+let _teamsData = null;           // Full teams JSON from API
+let _activeTeam = 'all-hands';   // Currently selected team key
+let _activePersona = '';         // Currently active persona name (the "leader")
 
 // ─── Live Streaming State ──────────────────────────────────────────────────
 // Instead of fetching merged history, we track assistant turns live via SSE
@@ -90,7 +93,7 @@ function _initView(el) {
     _injectStyles();
     el.innerHTML = `<div class="pa-root">${_buildLayout()}</div>`;
     _bindEvents(el);
-    _loadPersonas();
+    _loadTeams().then(() => _loadPersonas());
     _loadChatSelector();
     _loadAutoContinueSetting();
     _loadUserAvatar();
@@ -168,6 +171,12 @@ function _buildLayout() {
         <div class="pa-body">
             <div class="pa-roster-panel">
                 <h3 class="pa-roster-title">\u{1F465} Agent Roster</h3>
+                <div class="pa-team-selector">
+                    <select id="pa-team-dropdown" class="pa-team-dropdown" title="Active team">
+                        <option value="all-hands">\u{1F30D} All Hands</option>
+                    </select>
+                    <button class="pa-team-btn" id="pa-team-edit" title="Manage teams">\u{2699}</button>
+                </div>
                 <div class="pa-roster-list" id="pa-roster-list">
                     <div class="pa-loading">Loading personas...</div>
                 </div>
@@ -254,12 +263,116 @@ function _bindEvents(el) {
 
 async function _loadPersonas() {
     try {
-        const resp = await fetch(`${API}/personas`);
-        const data = await resp.json();
-        _allPersonas = data.personas || [];
+        // Fetch personas and active persona in parallel
+        const [persResp, chatResp] = await Promise.all([
+            fetch(`${API}/personas`),
+            fetch('/api/chats/active'),
+        ]);
+        const persData = await persResp.json();
+        _allPersonas = persData.personas || [];
+
+        // Get the active persona from chat settings
+        const chatData = await chatResp.json();
+        const activeChatName = chatData.active_chat || '';
+        if (activeChatName) {
+            try {
+                const settResp = await fetch(`/api/chats/${encodeURIComponent(activeChatName)}/settings`);
+                const settData = await settResp.json();
+                _activePersona = settData.settings?.persona || '';
+            } catch { _activePersona = ''; }
+        }
+
         _renderRoster();
     } catch (e) {
         console.error('[PA] Failed to load personas:', e);
+    }
+}
+
+async function _refreshActivePersona() {
+    try {
+        const chatResp = await fetch('/api/chats/active');
+        const chatData = await chatResp.json();
+        const activeChatName = chatData.active_chat || '';
+        if (!activeChatName) { _activePersona = ''; _renderRoster(); return; }
+        const settResp = await fetch(`/api/chats/${encodeURIComponent(activeChatName)}/settings`);
+        const settData = await settResp.json();
+        const newPersona = settData.settings?.persona || '';
+        if (newPersona !== _activePersona) {
+            _activePersona = newPersona;
+            _renderRoster();
+        }
+    } catch (e) {
+        console.error('[PA] Failed to refresh active persona:', e);
+    }
+}
+
+// ─── Teams ──────────────────────────────────────────────────────────────────
+
+async function _loadTeams() {
+    try {
+        const resp = await fetch(`${API}/teams`);
+        _teamsData = await resp.json();
+        _activeTeam = _teamsData.active_team || 'all-hands';
+        _renderTeamDropdown();
+    } catch (e) {
+        console.error('[PA] Failed to load teams:', e);
+    }
+}
+
+function _renderTeamDropdown() {
+    const dd = document.getElementById('pa-team-dropdown');
+    if (!dd || !_teamsData?.teams) return;
+
+    dd.innerHTML = Object.entries(_teamsData.teams).map(([key, team]) => {
+        const icon = key === 'all-hands' ? '\u{1F30D}' : '\u{1F465}';
+        let memberCount = key === 'all-hands' ? 0 : Object.keys(team.members || {}).length;
+        // Include the leader in the count if they're not already a team member
+        if (key !== 'all-hands' && _activePersona && !team.members?.[_activePersona]) memberCount++;
+        const count = key === 'all-hands' ? '' : ` (${memberCount})`;
+        return `<option value="${_esc(key)}" ${key === _activeTeam ? 'selected' : ''}>${icon} ${_esc(team.name)}${count}</option>`;
+    }).join('');
+
+    // Bind change handler
+    dd.onchange = async () => {
+        _activeTeam = dd.value;
+        await fetch(`${API}/teams/active`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json', 'X-CSRF-Token': CSRF()},
+            body: JSON.stringify({team: _activeTeam}),
+        });
+        _renderRoster();
+    };
+
+    // Bind edit/manage button
+    const editBtn = document.getElementById('pa-team-edit');
+    if (editBtn) editBtn.onclick = () => _openTeamManager();
+}
+
+function _getActiveTeamMembers() {
+    if (!_teamsData?.teams || _activeTeam === 'all-hands') return null;
+    const team = _teamsData.teams[_activeTeam];
+    if (!team) return null;
+    const members = team.members || {};
+    const enabled = new Set(Object.entries(members).filter(([, on]) => on).map(([n]) => n));
+    return enabled.size > 0 ? enabled : null;
+}
+
+async function _toggleTeamMember(personaName, enabled) {
+    if (_activeTeam === 'all-hands') return;
+    try {
+        await fetch(`${API}/teams/toggle`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json', 'X-CSRF-Token': CSRF()},
+            body: JSON.stringify({team: _activeTeam, persona: personaName, enabled}),
+        });
+        // Update local state
+        if (_teamsData?.teams?.[_activeTeam]) {
+            _teamsData.teams[_activeTeam].members[personaName] = enabled;
+        }
+        _renderTeamDropdown();
+        _renderRoster();
+    } catch (e) {
+        console.error('[PA] Toggle failed:', e);
     }
 }
 
@@ -274,28 +387,152 @@ function _renderRoster() {
         return;
     }
 
-    list.innerHTML = _allPersonas.map(p => {
+    // Determine which personas to show and their toggle state
+    const isTeamActive = _activeTeam !== 'all-hands' && _teamsData?.teams?.[_activeTeam];
+    const teamObj = isTeamActive ? _teamsData.teams[_activeTeam] : null;
+    const teamMembers = teamObj?.members || {};
+
+    // When a team is active, show team members + the active persona (leader) even if not on team
+    // When All Hands, show everyone with no toggles
+    let visiblePersonas;
+    if (isTeamActive) {
+        const memberNames = new Set(Object.keys(teamMembers));
+        visiblePersonas = _allPersonas.filter(p => memberNames.has(p.name) || p.name === _activePersona);
+    } else {
+        visiblePersonas = _allPersonas;
+    }
+
+    if (isTeamActive && visiblePersonas.length === 0) {
+        list.innerHTML = '<div class="pa-roster-empty">No members in this team.<br>Click \u2699 to manage teams.</div>';
+        return;
+    }
+
+    // Sort: leader first, then everyone else
+    const sorted = [...visiblePersonas].sort((a, b) => {
+        if (a.name === _activePersona) return -1;
+        if (b.name === _activePersona) return 1;
+        return 0;
+    });
+
+    list.innerHTML = sorted.map(p => {
         const color = p.trim_color || '#4a9eff';
+        const isLeader = p.name === _activePersona;
+        const isEnabled = isTeamActive ? (teamMembers[p.name] === true) : true;
+        const dimClass = (!isEnabled && isTeamActive && !isLeader) ? ' pa-roster-card-disabled' : '';
+        const leaderClass = isLeader ? ' pa-roster-card-leader' : '';
+
+        // Leader badge
+        const leaderBadge = isLeader ? '<span class="pa-leader-badge">\u{1F451} Leader</span>' : '';
+
+        // Show toggle only when a specific team is active (not for the leader)
+        const toggleHtml = (isTeamActive && !isLeader) ? `
+            <label class="pa-roster-toggle" title="Toggle active">
+                <input type="checkbox" class="pa-member-toggle" data-persona="${_esc(p.name)}" ${isEnabled ? 'checked' : ''}>
+                <span class="pa-toggle-slider"></span>
+            </label>` : '';
         return `
-            <div class="pa-roster-card" data-persona="${_esc(p.name)}" style="border-left-color: ${color}">
+            <div class="pa-roster-card${dimClass}${leaderClass}" data-persona="${_esc(p.name)}" style="border-left-color: ${color}">
                 <img class="pa-roster-avatar" src="/api/personas/${p.name}/avatar"
                      onerror="this.style.display='none'" style="border-color: ${color}">
                 <div class="pa-roster-info">
-                    <span class="pa-roster-name" style="color: ${color}">${_esc(p.display_name || p.name)}</span>
+                    <span class="pa-roster-name" style="color: ${color}">${_esc(p.display_name || p.name)}${leaderBadge}</span>
                     <span class="pa-roster-tagline">${_esc(p.tagline || '')}</span>
                     <span class="pa-roster-toolset">${_esc(p.toolset || 'none')} \u00B7 ${p.tool_count || 0} tools</span>
                 </div>
+                ${toggleHtml}
                 <span class="pa-roster-edit" title="Edit toolset">\u2699</span>
             </div>
         `;
     }).join('');
 
-    // Bind click handlers on cards
+    // Add "+ Add Member" button when a team is active
+    if (isTeamActive) {
+        const addBtn = document.createElement('div');
+        addBtn.className = 'pa-roster-add-btn';
+        addBtn.innerHTML = '\u{2795} Add Member';
+        addBtn.addEventListener('click', () => _showAddMemberPicker());
+        list.appendChild(addBtn);
+    }
+
+    // Bind click handlers on cards (edit toolset)
     list.querySelectorAll('.pa-roster-card').forEach(card => {
-        card.addEventListener('click', () => {
+        card.addEventListener('click', (e) => {
+            // Don't open editor if clicking toggle
+            if (e.target.closest('.pa-roster-toggle')) return;
             const name = card.dataset.persona;
             const persona = _allPersonas.find(p => p.name === name);
             if (persona) _openToolsetEditor(persona);
+        });
+    });
+
+    // Bind toggle handlers
+    list.querySelectorAll('.pa-member-toggle').forEach(cb => {
+        cb.addEventListener('change', (e) => {
+            e.stopPropagation();
+            _toggleTeamMember(cb.dataset.persona, cb.checked);
+        });
+    });
+}
+
+function _showAddMemberPicker() {
+    // Remove existing picker
+    document.getElementById('pa-add-member-picker')?.remove();
+
+    const teamObj = _teamsData?.teams?.[_activeTeam];
+    if (!teamObj) return;
+    const currentMembers = new Set(Object.keys(teamObj.members || {}));
+
+    // Get personas NOT already on this team
+    const available = _allPersonas.filter(p => !currentMembers.has(p.name));
+    if (available.length === 0) {
+        alert('All personas are already on this team.');
+        return;
+    }
+
+    const list = document.getElementById('pa-roster-list');
+    if (!list) return;
+
+    const picker = document.createElement('div');
+    picker.id = 'pa-add-member-picker';
+    picker.className = 'pa-add-member-picker';
+    picker.innerHTML = `
+        <div class="pa-add-member-header">
+            <span>Add to ${_esc(teamObj.name)}</span>
+            <button class="pa-add-member-close" title="Close">\u{2715}</button>
+        </div>
+        <div class="pa-add-member-list">
+            ${available.map(p => {
+                const color = p.trim_color || '#4a9eff';
+                return `
+                    <div class="pa-add-member-item" data-persona="${_esc(p.name)}">
+                        <img class="pa-add-member-avatar" src="/api/personas/${p.name}/avatar"
+                             onerror="this.style.display='none'" style="border-color:${color}">
+                        <span class="pa-add-member-name" style="color:${color}">${_esc(p.display_name || p.name)}</span>
+                        <span class="pa-add-member-toolset">${_esc(p.toolset || 'none')}</span>
+                        <button class="pa-add-member-btn" data-persona="${_esc(p.name)}">Add</button>
+                    </div>`;
+            }).join('')}
+        </div>`;
+
+    list.appendChild(picker);
+
+    // Bind close
+    picker.querySelector('.pa-add-member-close')?.addEventListener('click', () => picker.remove());
+
+    // Bind add buttons
+    picker.querySelectorAll('.pa-add-member-btn').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const name = btn.dataset.persona;
+            // Add to team as enabled
+            teamObj.members[name] = true;
+            await fetch(`${API}/teams`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json', 'X-CSRF-Token': CSRF()},
+                body: JSON.stringify(_teamsData),
+            });
+            _renderTeamDropdown();
+            _renderRoster();
         });
     });
 }
@@ -357,6 +594,10 @@ function _startListening() {
 
         // ── History commit ──
         eventBus.on('message_added', () => _fetchTranscript(true)),
+
+        // ── Persona/chat changes — refresh roster leader badge ──
+        eventBus.on('chat_settings_changed', () => _refreshActivePersona()),
+        eventBus.on('chat_switched', () => _refreshActivePersona()),
     );
     // Initial fetch when view becomes visible
     _fetchTranscript(true);
@@ -1755,6 +1996,210 @@ async function _toggleBarTts() {
     }
 }
 
+// ─── Team Manager Modal ─────────────────────────────────────────────────────
+
+function _openTeamManager() {
+    // Remove existing modal
+    document.getElementById('pa-team-modal')?.remove();
+
+    const modal = document.createElement('div');
+    modal.id = 'pa-team-modal';
+    modal.className = 'pa-editor-overlay';
+    modal.innerHTML = _buildTeamManagerHtml();
+    document.body.appendChild(modal);
+
+    // Close on backdrop click
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) _closeTeamManager();
+    });
+
+    _bindTeamManagerEvents();
+}
+
+function _buildTeamManagerHtml() {
+    const teams = _teamsData?.teams || {};
+
+    let teamListHtml = '';
+    for (const [key, team] of Object.entries(teams)) {
+        const memberCount = Object.values(team.members || {}).filter(Boolean).length;
+        const isBuiltin = team.builtin;
+        const isActive = key === _activeTeam;
+        const activeTag = isActive ? '<span class="pa-team-active-tag">ACTIVE</span>' : '';
+        const deleteBtn = isBuiltin ? '' : `<button class="pa-team-delete-btn" data-team="${_esc(key)}" title="Delete team">\u{1F5D1}</button>`;
+        const countLabel = key === 'all-hands' ? 'everyone' : `${memberCount} member${memberCount !== 1 ? 's' : ''}`;
+
+        teamListHtml += `
+            <div class="pa-team-row ${isActive ? 'pa-team-row-active' : ''}" data-team="${_esc(key)}">
+                <div class="pa-team-row-info">
+                    <span class="pa-team-row-name">${_esc(team.name)}</span> ${activeTag}
+                    <span class="pa-team-row-desc">${_esc(team.description || '')} \u00B7 ${countLabel}</span>
+                </div>
+                <div class="pa-team-row-actions">
+                    ${key !== 'all-hands' ? `<button class="pa-team-edit-members-btn" data-team="${_esc(key)}" title="Edit members">\u{270F}</button>` : ''}
+                    ${deleteBtn}
+                    ${!isActive ? `<button class="pa-team-activate-btn" data-team="${_esc(key)}" title="Set as active">Use</button>` : ''}
+                </div>
+            </div>`;
+    }
+
+    return `
+        <div class="pa-editor-modal" style="max-width:560px">
+            <div class="pa-editor-header">
+                <h2>\u{1F465} Team Manager</h2>
+                <button class="pa-editor-close" id="pa-team-close">\u{2715}</button>
+            </div>
+            <div class="pa-team-manager-body">
+                <div class="pa-team-list">${teamListHtml}</div>
+                <button class="pa-btn pa-team-create-btn" id="pa-team-create">\u{2795} Create New Team</button>
+            </div>
+        </div>`;
+}
+
+function _bindTeamManagerEvents() {
+    document.getElementById('pa-team-close')?.addEventListener('click', _closeTeamManager);
+
+    // Activate buttons
+    document.querySelectorAll('.pa-team-activate-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            _activeTeam = btn.dataset.team;
+            await fetch(`${API}/teams/active`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json', 'X-CSRF-Token': CSRF()},
+                body: JSON.stringify({team: _activeTeam}),
+            });
+            _renderTeamDropdown();
+            _renderRoster();
+            _openTeamManager(); // Re-render modal
+        });
+    });
+
+    // Delete buttons
+    document.querySelectorAll('.pa-team-delete-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const key = btn.dataset.team;
+            const name = _teamsData.teams[key]?.name || key;
+            if (!confirm(`Delete team "${name}"?`)) return;
+            delete _teamsData.teams[key];
+            if (_activeTeam === key) {
+                _activeTeam = 'all-hands';
+                _teamsData.active_team = 'all-hands';
+            }
+            await fetch(`${API}/teams`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json', 'X-CSRF-Token': CSRF()},
+                body: JSON.stringify(_teamsData),
+            });
+            _renderTeamDropdown();
+            _renderRoster();
+            _openTeamManager(); // Re-render
+        });
+    });
+
+    // Edit members buttons
+    document.querySelectorAll('.pa-team-edit-members-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            _openTeamEditor(btn.dataset.team);
+        });
+    });
+
+    // Create new team
+    document.getElementById('pa-team-create')?.addEventListener('click', () => {
+        _openTeamEditor(null); // null = creating new
+    });
+}
+
+function _openTeamEditor(teamKey) {
+    // Replace modal content with team editor
+    const modal = document.querySelector('#pa-team-modal .pa-editor-modal');
+    if (!modal) return;
+
+    const isNew = !teamKey;
+    const team = isNew ? {name: '', description: '', members: {}} : (_teamsData.teams[teamKey] || {name: '', description: '', members: {}});
+    const members = team.members || {};
+
+    // Build persona checklist
+    const checklistHtml = _allPersonas.map(p => {
+        const checked = isNew ? '' : (members[p.name] ? 'checked' : '');
+        const color = p.trim_color || '#4a9eff';
+        return `
+            <label class="pa-team-member-row">
+                <input type="checkbox" class="pa-team-member-cb" data-persona="${_esc(p.name)}" ${checked}>
+                <img class="pa-team-member-avatar" src="/api/personas/${p.name}/avatar"
+                     onerror="this.style.display='none'" style="border-color:${color}">
+                <span class="pa-team-member-name" style="color:${color}">${_esc(p.display_name || p.name)}</span>
+                <span class="pa-team-member-toolset">${_esc(p.toolset || 'none')}</span>
+            </label>`;
+    }).join('');
+
+    modal.innerHTML = `
+        <div class="pa-editor-header">
+            <h2>${isNew ? '\u{2795} New Team' : `\u{270F} Edit: ${_esc(team.name)}`}</h2>
+            <button class="pa-editor-close" id="pa-team-editor-close">\u{2715}</button>
+        </div>
+        <div class="pa-team-editor-body">
+            <div class="pa-team-editor-field">
+                <label>Team Name</label>
+                <input type="text" id="pa-team-name" class="pa-team-input" value="${_esc(team.name)}" placeholder="e.g. Finance Team">
+            </div>
+            <div class="pa-team-editor-field">
+                <label>Description</label>
+                <input type="text" id="pa-team-desc" class="pa-team-input" value="${_esc(team.description || '')}" placeholder="e.g. Investment research and analysis">
+            </div>
+            <div class="pa-team-editor-field">
+                <label>Members</label>
+                <div class="pa-team-member-list">${checklistHtml}</div>
+            </div>
+            <div class="pa-team-editor-footer">
+                <button class="pa-btn" id="pa-team-editor-back">\u{2190} Back</button>
+                <button class="pa-btn pa-btn-primary" id="pa-team-editor-save">\u{1F4BE} ${isNew ? 'Create' : 'Save'}</button>
+            </div>
+        </div>`;
+
+    document.getElementById('pa-team-editor-close')?.addEventListener('click', _closeTeamManager);
+    document.getElementById('pa-team-editor-back')?.addEventListener('click', () => _openTeamManager());
+
+    document.getElementById('pa-team-editor-save')?.addEventListener('click', async () => {
+        const name = document.getElementById('pa-team-name')?.value.trim();
+        const desc = document.getElementById('pa-team-desc')?.value.trim();
+        if (!name) { alert('Team name is required'); return; }
+
+        // Collect checked members
+        const newMembers = {};
+        document.querySelectorAll('.pa-team-member-cb').forEach(cb => {
+            if (cb.checked) newMembers[cb.dataset.persona] = true;
+        });
+
+        if (Object.keys(newMembers).length === 0) {
+            alert('Select at least one team member');
+            return;
+        }
+
+        // Generate key from name
+        const key = teamKey || name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+
+        _teamsData.teams[key] = {
+            name,
+            description: desc,
+            builtin: false,
+            members: newMembers,
+        };
+
+        await fetch(`${API}/teams`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json', 'X-CSRF-Token': CSRF()},
+            body: JSON.stringify(_teamsData),
+        });
+
+        _renderTeamDropdown();
+        _renderRoster();
+        _openTeamManager(); // Back to list
+    });
+}
+
+function _closeTeamManager() {
+    document.getElementById('pa-team-modal')?.remove();
+}
+
 // ─── Toast Notifications ────────────────────────────────────────────────────
 
 function _setupToastNotifications() {
@@ -2474,7 +2919,7 @@ function _injectStyles() {
     width: 32px; height: 32px; border-radius: 50%;
     border: 2px solid #4a9eff; object-fit: cover; flex-shrink: 0;
 }
-.pa-roster-info { display: flex; flex-direction: column; min-width: 0; }
+.pa-roster-info { display: flex; flex-direction: column; min-width: 0; flex: 1; }
 .pa-roster-name { font-weight: 700; font-size: 0.8rem; text-transform: capitalize; }
 .pa-roster-tagline {
     font-size: 0.7rem; color: #666; white-space: nowrap;
@@ -2699,10 +3144,176 @@ details[open].pa-think-block > .pa-think-summary::before { transform: rotate(90d
 
 /* Roster card interactive */
 .pa-roster-edit {
-    position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+    flex-shrink: 0;
     font-size: 0.9rem; color: #444; transition: color 0.15s; pointer-events: none;
 }
 .pa-roster-card:hover .pa-roster-edit { color: #888; }
+
+/* ── Team Selector ── */
+.pa-team-selector {
+    display: flex; align-items: center; gap: 6px;
+    padding: 6px 10px; border-bottom: 1px solid #1a1a24;
+}
+.pa-team-dropdown {
+    flex: 1; background: #0a0a12; border: 1px solid #1a1a24; color: #ccc;
+    padding: 5px 8px; border-radius: 6px; font-size: 0.78rem;
+    cursor: pointer; outline: none;
+}
+.pa-team-dropdown:hover { border-color: #333; }
+.pa-team-dropdown:focus { border-color: #4a9eff; }
+.pa-team-btn {
+    background: none; border: 1px solid transparent; color: #555;
+    padding: 4px 6px; border-radius: 4px; cursor: pointer;
+    font-size: 0.85rem; transition: all 0.15s;
+}
+.pa-team-btn:hover { color: #4a9eff; border-color: rgba(74,158,255,0.3); }
+
+/* ── Team Toggle on Roster Cards ── */
+.pa-roster-toggle {
+    flex-shrink: 0; cursor: pointer; z-index: 2;
+    margin-left: auto; margin-right: 4px;
+}
+.pa-member-toggle { display: none; }
+.pa-toggle-slider {
+    display: block; width: 28px; height: 16px;
+    background: #333; border-radius: 8px;
+    position: relative; transition: background 0.2s;
+}
+.pa-toggle-slider::after {
+    content: ''; position: absolute; left: 2px; top: 2px;
+    width: 12px; height: 12px; border-radius: 50%;
+    background: #888; transition: all 0.2s;
+}
+.pa-member-toggle:checked + .pa-toggle-slider { background: #22c55e; }
+.pa-member-toggle:checked + .pa-toggle-slider::after { left: 14px; background: #fff; }
+
+/* Disabled (toggled off) team member — dimmed but visible */
+.pa-roster-card-disabled { opacity: 0.35; }
+.pa-roster-card-disabled:hover { opacity: 0.6; }
+
+/* Leader card — the active persona at the top */
+.pa-roster-card-leader {
+    border-left-width: 4px !important;
+    background: linear-gradient(90deg, rgba(255,215,0,0.06) 0%, transparent 40%);
+    position: relative;
+}
+.pa-roster-card-leader::after {
+    content: ''; position: absolute; top: 0; left: 0; right: 0;
+    height: 1px; background: linear-gradient(90deg, rgba(255,215,0,0.3), transparent 60%);
+}
+.pa-leader-badge {
+    display: inline-block; font-size: 0.6rem; font-weight: 600;
+    color: #ffd700; background: rgba(255,215,0,0.1);
+    padding: 1px 6px; border-radius: 8px; margin-left: 6px;
+    vertical-align: middle; letter-spacing: 0.3px;
+}
+
+/* ── Add Member Button & Picker ── */
+.pa-roster-add-btn {
+    display: flex; align-items: center; justify-content: center;
+    padding: 8px; margin-top: 2px; border: 1px dashed #2a2a34;
+    border-radius: 6px; color: #555; font-size: 0.75rem;
+    cursor: pointer; transition: all 0.15s;
+}
+.pa-roster-add-btn:hover { color: #4a9eff; border-color: #4a9eff; }
+.pa-add-member-picker {
+    background: #0e0e18; border: 1px solid #2a2a34; border-radius: 8px;
+    margin-top: 4px; overflow: hidden;
+}
+.pa-add-member-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 10px; border-bottom: 1px solid #1a1a24;
+    font-size: 0.75rem; color: #888; font-weight: 600;
+}
+.pa-add-member-close {
+    background: none; border: none; color: #666; cursor: pointer;
+    font-size: 0.8rem; padding: 2px 4px;
+}
+.pa-add-member-close:hover { color: #ddd; }
+.pa-add-member-list { max-height: 200px; overflow-y: auto; padding: 4px; }
+.pa-add-member-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 8px; border-radius: 4px; transition: background 0.1s;
+}
+.pa-add-member-item:hover { background: #111120; }
+.pa-add-member-avatar {
+    width: 22px; height: 22px; border-radius: 50%;
+    border: 2px solid #4a9eff; object-fit: cover; flex-shrink: 0;
+}
+.pa-add-member-name { flex: 1; color: #ddd; font-size: 0.78rem; }
+.pa-add-member-toolset { color: #555; font-size: 0.68rem; }
+.pa-add-member-btn {
+    background: none; border: 1px solid #333; color: #888;
+    padding: 2px 10px; border-radius: 4px; cursor: pointer;
+    font-size: 0.7rem; transition: all 0.15s; flex-shrink: 0;
+}
+.pa-add-member-btn:hover { color: #4a9eff; border-color: #4a9eff; }
+
+/* ── Team Manager Modal ── */
+.pa-team-manager-body { padding: 16px; overflow-y: auto; max-height: 60vh; }
+.pa-team-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+.pa-team-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 12px; background: #0e0e18; border: 1px solid #1a1a24;
+    border-radius: 8px; transition: border-color 0.15s;
+}
+.pa-team-row:hover { border-color: #333; }
+.pa-team-row-active { border-color: #4a9eff; background: rgba(74,158,255,0.05); }
+.pa-team-row-info { flex: 1; min-width: 0; }
+.pa-team-row-name { font-weight: 600; color: #ddd; font-size: 0.85rem; }
+.pa-team-row-desc { display: block; color: #666; font-size: 0.72rem; margin-top: 2px; }
+.pa-team-active-tag {
+    display: inline-block; background: #4a9eff; color: #fff;
+    font-size: 0.6rem; padding: 1px 6px; border-radius: 3px;
+    font-weight: 700; margin-left: 6px; vertical-align: middle;
+}
+.pa-team-row-actions { display: flex; gap: 6px; align-items: center; flex-shrink: 0; }
+.pa-team-row-actions button {
+    background: none; border: 1px solid #333; color: #888;
+    padding: 3px 8px; border-radius: 4px; cursor: pointer;
+    font-size: 0.75rem; transition: all 0.15s;
+}
+.pa-team-row-actions button:hover { color: #ddd; border-color: #555; }
+.pa-team-activate-btn:hover { color: #4a9eff !important; border-color: #4a9eff !important; }
+.pa-team-delete-btn:hover { color: #e55 !important; border-color: #e55 !important; }
+.pa-team-create-btn {
+    width: 100%; padding: 10px; font-size: 0.82rem;
+    border: 1px dashed #333 !important; background: transparent !important;
+    color: #888 !important; border-radius: 8px;
+}
+.pa-team-create-btn:hover { color: #4a9eff !important; border-color: #4a9eff !important; }
+
+/* ── Team Editor (Create/Edit) ── */
+.pa-team-editor-body { padding: 16px; overflow-y: auto; max-height: 65vh; }
+.pa-team-editor-field { margin-bottom: 14px; }
+.pa-team-editor-field label { display: block; color: #888; font-size: 0.75rem; margin-bottom: 4px; font-weight: 600; }
+.pa-team-input {
+    width: 100%; background: #0a0a12; border: 1px solid #1a1a24; color: #ddd;
+    padding: 8px 10px; border-radius: 6px; font-size: 0.82rem; outline: none;
+    box-sizing: border-box;
+}
+.pa-team-input:focus { border-color: #4a9eff; }
+.pa-team-member-list {
+    max-height: 300px; overflow-y: auto;
+    border: 1px solid #1a1a24; border-radius: 8px; padding: 4px;
+}
+.pa-team-member-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 8px; border-radius: 4px; cursor: pointer;
+    transition: background 0.1s;
+}
+.pa-team-member-row:hover { background: #111120; }
+.pa-team-member-cb { accent-color: #4a9eff; }
+.pa-team-member-avatar {
+    width: 24px; height: 24px; border-radius: 50%;
+    border: 2px solid #4a9eff; object-fit: cover;
+}
+.pa-team-member-name { flex: 1; color: #ddd; font-size: 0.8rem; }
+.pa-team-member-toolset { color: #555; font-size: 0.7rem; }
+.pa-team-editor-footer {
+    display: flex; justify-content: space-between; gap: 8px;
+    padding-top: 12px; border-top: 1px solid #1a1a24;
+}
 
 /* ── Toolset Editor Modal ── */
 #pa-editor-overlay {

@@ -50,16 +50,17 @@ def _seed_defaults():
         toolsets_added = _seed_toolsets()
         prompts_added = _seed_prompts()
         personas_added = _seed_personas()
+        teams_seeded = _seed_teams()
 
         # Mark as done
         state.save("defaults_seeded", True)
 
-        total = toolsets_added + prompts_added + personas_added
+        total = toolsets_added + prompts_added + personas_added + teams_seeded
         if total > 0:
             logger.info(
                 f"[PERSONA-AGENTS] First-run setup complete: "
                 f"{toolsets_added} toolsets, {prompts_added} prompts, "
-                f"{personas_added} personas seeded"
+                f"{personas_added} personas, {teams_seeded} teams seeded"
             )
         else:
             logger.info("[PERSONA-AGENTS] All defaults already exist, nothing to seed")
@@ -126,6 +127,40 @@ def _seed_prompts():
             logger.warning(f"[PERSONA-AGENTS] Failed to seed prompt {name}: {msg}")
 
     return added
+
+
+def _seed_teams():
+    """Seed default teams file if it doesn't exist. Returns 1 if seeded, 0 if already exists."""
+    teams_file = Path(__file__).parent.parent.parent / 'user' / 'plugin_state' / 'persona-teams.json'
+    if teams_file.exists():
+        return 0
+
+    defaults_file = DEFAULTS_DIR / "teams.json"
+    if not defaults_file.exists():
+        # Create minimal default
+        data = {
+            "active_team": "all-hands",
+            "teams": {
+                "all-hands": {
+                    "name": "All Hands",
+                    "description": "Every persona in the system",
+                    "builtin": True,
+                    "members": {}
+                }
+            }
+        }
+    else:
+        with open(defaults_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        # Strip comments
+        data.pop('_comment', None)
+
+    teams_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(teams_file, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+    logger.info(f"[PERSONA-AGENTS] Seeded teams file with {len(data.get('teams', {}))} team(s)")
+    return 1
 
 
 def _seed_personas():

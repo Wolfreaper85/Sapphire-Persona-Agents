@@ -111,5 +111,31 @@
       "record_lesson",
       "contradict_lesson"
     ]
+  },
+  "pa_financial": {
+    "emoji": "\ud83d\udcb0",
+    "description": "Financial advisor — dividend research, earnings, portfolio analysis, market data",
+    "functions": [
+      "web_search",
+      "get_website",
+      "get_wikipedia",
+      "research_topic",
+      "get_site_links",
+      "save_knowledge",
+      "search_knowledge",
+      "delete_knowledge",
+      "save_memory",
+      "search_memory",
+      "get_time",
+      "notepad_read",
+      "notepad_append_lines",
+      "notepad_insert_line",
+      "notepad_delete_lines",
+      "shared_context_write",
+      "shared_context_read",
+      "sub_delegate",
+      "record_lesson",
+      "contradict_lesson"
+    ]
   }
 }
