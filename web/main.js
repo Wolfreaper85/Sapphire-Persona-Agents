@@ -911,6 +911,25 @@ function _renderTranscript(chatMessages, delTranscript, activeDelegates) {
         _updateLiveBubble();
     }
 
+    // Bind cancel delegate buttons on active cards
+    container.querySelectorAll('.pa-cancel-delegate-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const delegateId = btn.dataset.delegateId;
+            if (!delegateId) return;
+            btn.disabled = true;
+            btn.textContent = '…';
+            try {
+                await fetch(`${API}/cancel-delegate`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ delegate_id: delegateId }),
+                });
+            } catch (e) {
+                console.error('[PA] Cancel delegate failed:', e);
+            }
+        });
+    });
+
     // Bind TTS buttons
     container.querySelectorAll('.pa-tts-btn').forEach(btn => {
         btn.addEventListener('click', () => _playTts(btn));
@@ -1175,6 +1194,8 @@ function _renderActive(d) {
                      onerror="this.style.display='none'" style="border-color:${color}">
                 <span class="pa-msg-name" style="color:${color}">${_esc(d.display_name || d.persona)}</span>
                 <span class="pa-msg-meta">\u{1F7E1} working (${d.elapsed}s) · ${_esc(tools)}</span>
+                <button class="pa-cancel-delegate-btn" data-delegate-id="${_esc(d.id)}"
+                        title="Cancel ${_esc(d.display_name || d.persona)}">✕</button>
             </div>
             <div class="pa-typing">
                 <span class="pa-typing-dots"><span>.</span><span>.</span><span>.</span></span>
@@ -3179,6 +3200,12 @@ function _injectStyles() {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.7; }
 }
+.pa-cancel-delegate-btn {
+    background: none; border: 1px solid #555; color: #e74c3c;
+    padding: 2px 8px; border-radius: 4px; cursor: pointer;
+    font-size: 0.75rem; margin-left: auto; transition: all 0.15s;
+}
+.pa-cancel-delegate-btn:hover { background: #e74c3c; color: #fff; border-color: #e74c3c; }
 
 /* Bar TTS button (next to send) */
 .pa-btn-tts-bar {

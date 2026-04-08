@@ -202,6 +202,30 @@ def _get_skills_mod():
     return sys.modules.get("persona_agents_skills")
 
 
+async def cancel_delegate(**kwargs):
+    """Cancel a running delegate from the UI."""
+    body = kwargs.get("body", {})
+    delegate_id = body.get("delegate_id", "").strip()
+
+    if not delegate_id:
+        return {"error": "delegate_id required"}
+
+    shared = _get_shared()
+    if not shared:
+        return {"error": "delegation system not loaded"}
+
+    delegate = shared._delegates.get(delegate_id)
+    if not delegate:
+        return {"error": f"Delegate '{delegate_id}' not found"}
+
+    if delegate.status != 'running':
+        return {"error": f"Delegate already {delegate.status}"}
+
+    delegate.cancel(force=False)
+    logger.info(f"[ROUTE] Cancel delegate {delegate_id} ({delegate.display_name}) from UI")
+    return {"success": True, "delegate_id": delegate_id}
+
+
 async def get_skills(**kwargs):
     """Get a persona's skills.md content."""
     query = kwargs.get("query", {})

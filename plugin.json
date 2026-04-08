@@ -81,6 +81,11 @@
                 "handler": "routes/delegation.py:toggle_team_member"
             },
             {
+                "method": "POST",
+                "path": "cancel-delegate",
+                "handler": "routes/delegation.py:cancel_delegate"
+            },
+            {
                 "method": "GET",
                 "path": "skills",
                 "handler": "routes/delegation.py:get_skills"
