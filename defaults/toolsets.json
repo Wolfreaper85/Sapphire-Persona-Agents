@@ -7,6 +7,8 @@
       "delegate_task",
       "check_delegates",
       "get_delegate_result",
+      "cancel_delegate",
+      "send_message",
       "ask_claude",
       "save_memory",
       "search_memory",

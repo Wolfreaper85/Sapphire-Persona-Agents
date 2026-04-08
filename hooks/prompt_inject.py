@@ -31,6 +31,7 @@ _TASK_FUNCTIONS = {
     'check_internet', 'get_external_ip', 'website_status',
     # Delegation (coordinator)
     'delegate_task', 'check_delegates', 'get_delegate_result',
+    'cancel_delegate', 'send_message',
     # Tandem browser
     'tandem_browse', 'tandem_read_page', 'tandem_search', 'tandem_click_link',
     # Persona creation
@@ -206,6 +207,9 @@ def _inject_roster(event):
         "DELEGATION RULES:\n"
         + "\n".join(rules) + "\n"
         "- Call delegate_task(persona='name', task='specific task description')\n"
+        "- To follow up on a completed delegate, use send_message(delegate_id='...', message='...')\n"
+        "  This continues their conversation with full context — they remember everything.\n"
+        "- To stop a running delegate, use cancel_delegate(delegate_id='...')\n"
         "After receiving reports, summarize findings for the user in your own voice.\n"
         "Do NOT tell the user to use tools — just give them the answer."
     )

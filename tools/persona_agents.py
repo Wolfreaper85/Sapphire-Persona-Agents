@@ -48,6 +48,11 @@ except Exception as _e:
 ENABLED = True
 EMOJI = '\U0001f3ad'
 
+
+class _DelegateCancelled(Exception):
+    """Raised when a delegate is cancelled mid-execution."""
+    pass
+
 # ── Monkey-patch ExecutionContext.run() ──────────────────────────────────────
 # Core's run() calls filter_to_thinking_only() on tool-call rounds, which
 # strips all real content and keeps only <think> blocks. The streaming chat
@@ -83,8 +88,16 @@ try:
         context_limit = self.task_settings.get("context_limit") or getattr(_ec_config, 'CONTEXT_LIMIT', 0)
 
         final_content = None
+        _cancel = getattr(self, '_cancel_event', None)
+        _force = getattr(self, '_force_cancel_event', None)
 
         for i in range(max_iterations):
+            # Check cancellation between iterations
+            if _force and _force.is_set():
+                raise _DelegateCancelled()
+            if _cancel and _cancel.is_set():
+                break  # Graceful — stop after current iteration, return what we have
+
             if context_limit > 0:
                 from core.chat.history import count_tokens
                 total_tokens = sum(count_tokens(str(m.get("content", ""))) for m in messages)
@@ -107,6 +120,11 @@ try:
                 if content.strip():
                     final_content = content
                 self.tool_log.extend(tc.get('function', {}).get('name', '?') for tc in tool_calls)
+
+                # Check force cancel before executing tools
+                if _force and _force.is_set():
+                    raise _DelegateCancelled()
+
                 tools_executed, tool_images = self.tool_engine.execute_tool_calls(
                     tool_calls, messages, None, self.provider, scopes=self.scopes,
                     allowed_tools=self._allowed_tool_names
@@ -149,6 +167,9 @@ try:
             if tool_results:
                 final_content = "\n\n".join(tool_results[-3:])  # Last 3 tool results
 
+        # Store conversation history for potential continuation
+        self._messages = messages
+
         return final_content or ""
 
     _EC.run = _patched_run
@@ -161,6 +182,8 @@ AVAILABLE_FUNCTIONS = [
     'delegate_task',
     'check_delegates',
     'get_delegate_result',
+    'cancel_delegate',
+    'send_message',
 ]
 
 TOOLS = [
@@ -236,6 +259,62 @@ TOOLS = [
             }
         }
     },
+    {
+        "type": "function",
+        "is_local": True,
+        "function": {
+            "name": "cancel_delegate",
+            "description": (
+                "Cancel a running delegate. By default this is graceful — the delegate finishes their current "
+                "tool call and stops. Set force=true to stop them immediately (partial results may be lost).\n"
+                "Use check_delegates first to see who's running."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "delegate_id": {
+                        "type": "string",
+                        "description": "The delegate's ID (from check_delegates)"
+                    },
+                    "force": {
+                        "type": "string",
+                        "description": "Set to 'true' for immediate cancellation. Default is graceful (finishes current tool)."
+                    }
+                },
+                "required": ["delegate_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "is_local": True,
+        "function": {
+            "name": "send_message",
+            "description": (
+                "Send a follow-up message to a completed delegate, continuing their conversation with full context.\n"
+                "The delegate resumes with their entire previous conversation history intact — they remember "
+                "everything from their first task. Use this for multi-step work: first delegate a task, then "
+                "follow up with corrections, additional instructions, or a second phase.\n\n"
+                "The delegate must have finished (done/failed/cancelled) before you can send a follow-up.\n"
+                "Do NOT use this for new unrelated tasks — use delegate_task instead.\n\n"
+                "Example: send_message(delegate_id='abc123', message='Good work. Now also check the SSL certificate expiry.')"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "delegate_id": {
+                        "type": "string",
+                        "description": "The delegate's ID (from delegate_task or check_delegates)"
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "The follow-up instruction or question for the delegate"
+                    }
+                },
+                "required": ["delegate_id", "message"]
+            }
+        }
+    },
 ]
 
 
@@ -307,7 +386,7 @@ class PersonaDelegate:
         self.toolset = toolset
         self.context = context
         self.chat_name = chat_name
-        self.status = 'running'  # running | done | failed
+        self.status = 'running'  # running | done | failed | cancelled
         self.result = None
         self.error = None
         self.tool_log = []
@@ -315,6 +394,10 @@ class PersonaDelegate:
         self.end_time = None
         self._thread = None
         self._on_complete = on_complete
+        self._cancel = threading.Event()       # Graceful: finish current tool, then stop
+        self._force_cancel = threading.Event()  # Immediate: stop ASAP
+        self._messages = None  # Conversation history for continuation
+        self._ctx = None       # ExecutionContext for continuation
 
         # Persona visual info
         settings = persona_data.get('settings', {})
@@ -331,6 +414,16 @@ class PersonaDelegate:
         end = self.end_time or time.time()
         return round(end - self.start_time, 1)
 
+    @property
+    def is_cancelled(self):
+        return self._cancel.is_set() or self._force_cancel.is_set()
+
+    def cancel(self, force=False):
+        """Request cancellation. force=True stops immediately, False finishes current tool."""
+        if force:
+            self._force_cancel.set()
+        self._cancel.set()
+
     def start(self):
         self._thread = threading.Thread(
             target=self._run, daemon=True,
@@ -341,7 +434,13 @@ class PersonaDelegate:
     def _run(self):
         try:
             self._execute()
-            self.status = 'done'
+            if self.is_cancelled:
+                self.status = 'cancelled'
+            else:
+                self.status = 'done'
+        except _DelegateCancelled:
+            self.status = 'cancelled'
+            self.result = self.result or '(Cancelled by lead)'
         except Exception as e:
             logger.error(f"[PERSONA-AGENT] {self.persona_name} failed: {e}", exc_info=True)
             self.status = 'failed'
@@ -421,7 +520,9 @@ class PersonaDelegate:
         }
 
         ctx = ExecutionContext(fm, te, task_settings)
-        ctx._persona_agent = True  # Flag for patched run() to preserve content
+        ctx._persona_agent = True       # Flag for patched run() to preserve content
+        ctx._cancel_event = self._cancel        # Graceful cancel
+        ctx._force_cancel_event = self._force_cancel  # Force cancel
 
         # Build the delegation prompt — tells the persona they've been called in
         delegation_prompt = (
@@ -439,6 +540,10 @@ class PersonaDelegate:
         log_event("EXEC", f"{self.persona_name} starting execution (toolset={self.toolset}, provider={provider_key})")
 
         raw = ctx.run(delegation_prompt)
+
+        # Save context for potential continuation via send_message
+        self._ctx = ctx
+        self._messages = getattr(ctx, '_messages', None)
 
         logger.info(f"[PERSONA-AGENT] {self.persona_name} raw result type={type(raw).__name__}, "
                      f"len={len(raw) if raw else 0}, preview={repr((raw or '')[:200])}")
@@ -636,6 +741,12 @@ def execute(function_name, arguments, config, plugin_settings=None):
     elif function_name == 'get_delegate_result':
         return _get_delegate_result(arguments)
 
+    elif function_name == 'cancel_delegate':
+        return _cancel_delegate(arguments)
+
+    elif function_name == 'send_message':
+        return _send_message(arguments)
+
     return f"Unknown function: {function_name}", False
 
 
@@ -676,8 +787,17 @@ def _delegate_task(arguments):
     else:
         toolset = persona_toolset
 
-    # Check concurrent limit
+    # Check concurrent limit + prune stale completed delegates (>10 min old)
     with _lock:
+        stale_cutoff = time.time() - 600
+        stale_ids = [
+            d.id for d in _delegates.values()
+            if d.status in ('done', 'failed', 'cancelled')
+            and d.end_time and d.end_time < stale_cutoff
+        ]
+        for sid in stale_ids:
+            _delegates.pop(sid, None)
+
         active_count = sum(1 for d in _delegates.values() if d.status == 'running')
         if active_count >= 3:
             return "ERROR: Maximum 3 delegates can run at once. Wait for one to finish or check results.", False
@@ -758,6 +878,8 @@ def _delegate_task(arguments):
         )
 
     # Delegate finished — return the full result directly
+    # Delegate stays in _delegates for potential send_message continuation.
+    # Cleaned up by get_delegate_result or when a new delegate takes the slot.
     tools_used = ', '.join(delegate.tool_log) if delegate.tool_log else 'none'
     result = delegate.result or delegate.error or '(No result)'
 
@@ -765,11 +887,7 @@ def _delegate_task(arguments):
                 f"status={delegate.status}, result_len={len(result)}, "
                 f"result_preview={repr(result[:150])}")
 
-    # Clean up the delegate from the active pool
-    with _lock:
-        _delegates.pop(delegate_id, None)
-
-    status_icon = '✅' if delegate.status == 'done' else '❌'
+    status_icon = '\u2705' if delegate.status == 'done' else '\u274c'
     return (
         f"{status_icon} {delegate.display_name} — {delegate.status} in {delegate.elapsed}s | tools: {tools_used}\n\n"
         f"{result}",
@@ -789,7 +907,8 @@ def _check_delegates():
     lines = [f"Persona Delegates ({len(delegates)}):"]
     for d in delegates:
         icon = {
-            'running': '\U0001f7e1', 'done': '\U0001f7e2', 'failed': '\U0001f534'
+            'running': '\U0001f7e1', 'done': '\U0001f7e2', 'failed': '\U0001f534',
+            'cancelled': '\U0001f7e0',
         }.get(d.status, '\u2753')
         lines.append(f"  {icon} {d.display_name} [{d.id}] \u2014 {d.status} ({d.elapsed}s)")
         lines.append(f"      Task: {d.task[:100]}")
@@ -828,6 +947,195 @@ def _get_delegate_result(arguments):
 
     return (
         f"[{delegate.display_name} \u2014 {delegate.status} in {delegate.elapsed}s | tools: {tools_used}]\n\n"
+        f"{result}",
+        True
+    )
+
+
+def _cancel_delegate(arguments):
+    """Cancel a running delegate. Graceful by default, force with force=true."""
+    delegate_id = arguments.get('delegate_id', '').strip()
+    force = str(arguments.get('force', '')).lower() in ('true', '1', 'yes')
+
+    if not delegate_id:
+        return "ERROR: delegate_id is required.", False
+
+    with _lock:
+        delegate = _delegates.get(delegate_id)
+
+    if not delegate:
+        return f"ERROR: Delegate '{delegate_id}' not found.", False
+
+    if delegate.status != 'running':
+        return f"{delegate.display_name} is already {delegate.status}.", True
+
+    mode = 'force' if force else 'graceful'
+    delegate.cancel(force=force)
+    log_event("CANCEL", f"{delegate.display_name} ({delegate_id}) — {mode} cancel requested")
+
+    if force:
+        return (
+            f"Force cancel sent to {delegate.display_name}. "
+            f"They will stop immediately (partial results may be available via get_delegate_result).",
+            True
+        )
+    return (
+        f"Graceful cancel sent to {delegate.display_name}. "
+        f"They will finish their current tool call and then stop.",
+        True
+    )
+
+
+def _send_message(arguments):
+    """Send a follow-up message to a completed delegate, continuing their conversation."""
+    delegate_id = arguments.get('delegate_id', '').strip()
+    message = arguments.get('message', '').strip()
+
+    if not delegate_id:
+        return "ERROR: delegate_id is required.", False
+    if not message:
+        return "ERROR: message is required.", False
+
+    with _lock:
+        delegate = _delegates.get(delegate_id)
+
+    if not delegate:
+        return f"ERROR: Delegate '{delegate_id}' not found. They may have been dismissed already.", False
+
+    if delegate.status == 'running':
+        return f"{delegate.display_name} is still working. Wait for them to finish first.", True
+
+    if not delegate._messages or not delegate._ctx:
+        return (
+            f"{delegate.display_name} has no conversation history to continue. "
+            f"Use delegate_task to start a new delegation instead.",
+            False
+        )
+
+    # Reset delegate state for continuation
+    delegate.status = 'running'
+    delegate.result = None
+    delegate.error = None
+    delegate.start_time = time.time()
+    delegate.end_time = None
+    delegate._cancel = threading.Event()
+    delegate._force_cancel = threading.Event()
+
+    # Store the follow-up message for the continuation thread
+    delegate._continuation_message = message
+
+    def _continue():
+        try:
+            ctx = delegate._ctx
+            ctx._cancel_event = delegate._cancel
+            ctx._force_cancel_event = delegate._force_cancel
+
+            # Build the history from previous messages (skip system prompt)
+            history = [m for m in delegate._messages if m.get('role') != 'system']
+
+            follow_up = (
+                f"[Follow-up from your lead]\n"
+                f"{message}"
+            )
+
+            log_event("CONTINUE", f"{delegate.persona_name} ({delegate_id}): {message[:80]}")
+
+            raw = ctx.run(follow_up, history_messages=history)
+
+            # Save updated conversation for further continuation
+            delegate._messages = getattr(ctx, '_messages', None)
+            delegate.tool_log = ctx.tool_log
+
+            result = _strip_thinking(raw) if raw else ''
+            if not result and raw and raw.strip():
+                result = raw.strip()
+            delegate.result = result or None
+            delegate.status = 'done' if not delegate.is_cancelled else 'cancelled'
+
+        except _DelegateCancelled:
+            delegate.status = 'cancelled'
+            delegate.result = delegate.result or '(Cancelled by lead)'
+        except Exception as e:
+            logger.error(f"[PERSONA-AGENT] {delegate.persona_name} continuation failed: {e}", exc_info=True)
+            delegate.status = 'failed'
+            delegate.error = str(e)
+        finally:
+            delegate.end_time = time.time()
+            _add_to_session(delegate)
+            try:
+                from core.event_bus import publish
+                publish('delegate_completed', {
+                    'id': delegate.id,
+                    'persona': delegate.persona_name,
+                    'display_name': delegate.display_name,
+                    'status': delegate.status,
+                    'elapsed': delegate.elapsed,
+                    'tool_log': delegate.tool_log,
+                    'trim_color': delegate.trim_color,
+                    'chat_name': delegate.chat_name,
+                })
+            except Exception:
+                pass
+
+    thread = threading.Thread(
+        target=_continue, daemon=True,
+        name=f'persona-continue-{delegate.persona_name}-{delegate.id}'
+    )
+    delegate._thread = thread
+    thread.start()
+
+    # Add dispatch notice to session
+    session = _get_session(delegate.chat_name)
+    session['transcript'].append({
+        'type': 'dispatch',
+        'persona': delegate.persona_name,
+        'display_name': delegate.display_name,
+        'task': f'Follow-up: {message[:100]}',
+        'toolset': delegate.toolset,
+        'trim_color': delegate.trim_color,
+        'avatar': delegate.avatar,
+        'timestamp': datetime.now().isoformat(),
+    })
+    _save_sessions()
+
+    try:
+        from core.event_bus import publish
+        publish('delegate_dispatched', {
+            'id': delegate.id,
+            'persona': delegate.persona_name,
+            'display_name': delegate.display_name,
+            'task': f'Follow-up: {message[:100]}',
+            'toolset': delegate.toolset,
+            'trim_color': delegate.trim_color,
+            'chat_name': delegate.chat_name,
+        })
+    except Exception:
+        pass
+
+    # Synchronous wait like delegate_task
+    MAX_WAIT = 300
+    poll_interval = 0.5
+    waited = 0.0
+    while delegate.status == 'running' and waited < MAX_WAIT:
+        time.sleep(poll_interval)
+        waited += poll_interval
+
+    if delegate.status == 'running':
+        return (
+            f"{delegate.display_name} is still working on the follow-up (>{MAX_WAIT}s).\n"
+            f"Use check_delegates to monitor.",
+            True
+        )
+
+    tools_used = ', '.join(delegate.tool_log) if delegate.tool_log else 'none'
+    result = delegate.result or delegate.error or '(No result)'
+
+    with _lock:
+        _delegates.pop(delegate_id, None)
+
+    status_icon = '\u2705' if delegate.status == 'done' else '\u274c'
+    return (
+        f"{status_icon} {delegate.display_name} (follow-up) \u2014 {delegate.status} in {delegate.elapsed}s | tools: {tools_used}\n\n"
         f"{result}",
         True
     )
