@@ -652,8 +652,9 @@ function _startListening() {
         eventBus.on('ai_typing_end', () => {
             _aiTyping = false;
             _endLiveTurn();
+            // Only fetch transcript ONCE when streaming ends (not during)
             _fetchTranscript(true);
-            setTimeout(() => _fetchTranscript(true), 1500);
+            setTimeout(() => _fetchTranscript(true), 2000);
         }),
 
         // ── Live streaming — capture actual text chunks ──
@@ -682,17 +683,21 @@ function _startListening() {
                     ...data,
                 });
             }
-            _fetchTranscript(true);
+            // Don't re-render during active streaming — causes blink
+            if (!_aiTyping) _fetchTranscript(true);
             _setOrbState('thinking');
         }),
         eventBus.on('delegate_completed', (data) => {
             if (_selectedChat && data.chat_name !== _selectedChat) return;
-            _fetchTranscript(true);
+            // Don't re-render during active streaming — causes blink
+            if (!_aiTyping) _fetchTranscript(true);
             _showToast(data);
         }),
 
-        // ── History commit ──
-        eventBus.on('message_added', () => _fetchTranscript(true)),
+        // ── History commit — skip during live streaming to prevent blink ──
+        eventBus.on('message_added', () => {
+            if (!_aiTyping) _fetchTranscript(true);
+        }),
 
         // ── Persona/chat changes — refresh roster leader badge ──
         eventBus.on('chat_settings_changed', () => _refreshActivePersona()),
@@ -843,8 +848,21 @@ function _renderTranscript(chatMessages, delTranscript, activeDelegates) {
         timeline.push({ sort_time: msg.timestamp || '', kind: 'chat', data: msg });
     }
 
-    // Add delegation transcript entries
+    // Add delegation transcript entries — but skip if already covered by chat history
+    // Chat history already contains delegate_task tool calls/results, so the delegation
+    // transcript (dispatch/result) entries would be duplicates. Only add entries that
+    // DON'T overlap with chat messages (e.g., entries from before history was loaded,
+    // or entries for other chats).
+    const chatTimestamps = new Set(chatMessages.map(m => m.timestamp).filter(Boolean));
+    const hasHistoryDelegations = chatMessages.some(m =>
+        m.role === 'assistant' && m.parts?.some(p => p.type === 'tool_call' && p.name === 'delegate_task')
+    );
     for (const entry of delTranscript) {
+        // If chat history already has delegation tool calls, skip transcript dispatch/result
+        // entries — they're the same data from a different source
+        if (hasHistoryDelegations && (entry.type === 'dispatch' || entry.type === 'result')) {
+            continue;
+        }
         timeline.push({ sort_time: entry.timestamp || '', kind: entry.type, data: entry });
     }
 
