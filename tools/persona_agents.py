@@ -29,6 +29,28 @@ def _load_sibling_module(filename, module_name):
     return mod
 
 try:
+    _skills_mod = _load_sibling_module("agent_skills.py", "persona_agents_skills")
+    from persona_agents_skills import get_skills_for_prompt as _skills_get_prompt
+    _has_skills = True
+except Exception as _se:
+    logger.warning(f"[PERSONA-AGENT] Agent skills module unavailable: {_se}")
+    _has_skills = False
+    def _skills_get_prompt(*a, **kw): return ""
+
+try:
+    _lessons_mod = _load_sibling_module("agent_lessons.py", "persona_agents_lessons")
+    from persona_agents_lessons import record_lesson as _lessons_record
+    from persona_agents_lessons import contradict_lesson as _lessons_contradict
+    from persona_agents_lessons import get_lessons_for_prompt as _lessons_get_prompt
+    _has_lessons = True
+except Exception as _le:
+    logger.warning(f"[PERSONA-AGENT] Agent lessons module unavailable: {_le}")
+    _has_lessons = False
+    def _lessons_record(*a, **kw): pass
+    def _lessons_contradict(*a, **kw): pass
+    def _lessons_get_prompt(*a, **kw): return ""
+
+try:
     _dlog_mod = _load_sibling_module("delegation_log.py", "persona_agents_delegation_log")
     log_dispatch = _dlog_mod.log_dispatch
     log_tool_call = _dlog_mod.log_tool_call
@@ -184,6 +206,11 @@ AVAILABLE_FUNCTIONS = [
     'get_delegate_result',
     'cancel_delegate',
     'send_message',
+    'shared_context_write',
+    'shared_context_read',
+    'sub_delegate',
+    'record_lesson',
+    'contradict_lesson',
 ]
 
 TOOLS = [
@@ -315,6 +342,139 @@ TOOLS = [
             }
         }
     },
+    {
+        "type": "function",
+        "is_local": True,
+        "function": {
+            "name": "shared_context_write",
+            "description": (
+                "Write a finding or piece of information to the shared team scratchpad.\n"
+                "Other agents working on the same session can read this. Use it to share "
+                "discoveries, results, or context that other specialists might need.\n\n"
+                "Example: shared_context_write(key='server_status', value='nginx is down on port 443, "
+                "SSL cert expired 2 days ago')"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "A short label for this finding (e.g. 'server_status', 'research_results', 'error_log')"
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "The information to share with the team"
+                    }
+                },
+                "required": ["key", "value"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "is_local": True,
+        "function": {
+            "name": "shared_context_read",
+            "description": (
+                "Read the shared team scratchpad to see what other agents have found.\n"
+                "Returns all entries written by any agent in this session.\n"
+                "Use this before starting work to check if another specialist already found relevant info."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "is_local": True,
+        "function": {
+            "name": "sub_delegate",
+            "description": (
+                "Spawn a helper agent to handle a sub-task. Use this when your main task "
+                "requires work outside your specialty — e.g., an engineer needing web research, "
+                "or a researcher needing a command run.\n\n"
+                "The helper runs with fewer tool rounds (max 5) and returns their result directly.\n"
+                "You stay in control — review their output and incorporate it into your work.\n\n"
+                "Example: sub_delegate(persona='researcher', task='Find the latest Python 3.13 changelog')"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "persona": {
+                        "type": "string",
+                        "description": "Name of the persona to sub-delegate to. Must be a specialist, not a coordinator."
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "Clear description of the sub-task. Be specific."
+                    }
+                },
+                "required": ["persona", "task"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "is_local": True,
+        "function": {
+            "name": "record_lesson",
+            "description": (
+                "Record something you learned during this task for future reference.\n"
+                "Next time you're activated, you'll see your past lessons before starting work.\n\n"
+                "Use this for:\n"
+                "- Tool quirks you discovered ('pip on this system needs --user flag')\n"
+                "- Service issues ('api.example.com requires Bearer auth header')\n"
+                "- User preferences ('user prefers verbose output with explanations')\n"
+                "- Workarounds that worked ('site X blocks requests without User-Agent header')\n\n"
+                "Categories control how long the lesson persists:\n"
+                "- 'temporary': 24 hours (service outages, transient errors)\n"
+                "- 'session': 7 days (project-specific workarounds, current context)\n"
+                "- 'permanent': 90 days (system config, tool behavior, user preferences)\n\n"
+                "Keep lessons short and specific — 1-2 sentences max."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "lesson": {
+                        "type": "string",
+                        "description": "What you learned (1-2 sentences). Be specific and actionable."
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": ["temporary", "session", "permanent"],
+                        "description": "How long to remember this. 'temporary'=24h, 'session'=7d, 'permanent'=90d"
+                    }
+                },
+                "required": ["lesson", "category"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "is_local": True,
+        "function": {
+            "name": "contradict_lesson",
+            "description": (
+                "Mark one of your past lessons as wrong or outdated.\n"
+                "Use this when you discover that a previous lesson no longer applies "
+                "(site came back up, tool was fixed, approach changed).\n"
+                "This weakens the lesson — if contradicted enough times it's automatically removed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "lesson": {
+                        "type": "string",
+                        "description": "The lesson text to contradict (roughly match the original wording)"
+                    }
+                },
+                "required": ["lesson"]
+            }
+        }
+    },
 ]
 
 
@@ -323,6 +483,7 @@ TOOLS = [
 
 _delegates = {}        # id -> PersonaDelegate
 _sessions = {}         # chat_name -> session dict (transcript for visual panel)
+_shared_ctx = {}       # chat_name -> {key: {value, author, timestamp}} — shared scratchpad
 _lock = threading.Lock()
 
 # Persistence — save session transcripts so they survive restarts
@@ -501,13 +662,29 @@ class PersonaDelegate:
 
         # Build task settings — delegates use minimal scopes to stay within
         # context limits. They're doing a focused task, not a full conversation.
+        # Detect context limit from provider config for budget tracking
+        context_budget = 0
+        try:
+            import config as _cfg
+            context_budget = getattr(_cfg, 'CONTEXT_LIMIT', 0)
+            # Delegates get 70% of the total context to leave room for the lead
+            if context_budget:
+                context_budget = int(context_budget * 0.7)
+        except Exception:
+            pass
+
+        # Sub-delegates get fewer rounds to keep them focused
+        sub_depth = getattr(self, '_sub_depth', 0)
+        max_rounds = 5 if sub_depth > 0 else 10
+
         task_settings = {
             'prompt': prompt_name,
             'toolset': self.toolset,
             'provider': provider_key if provider_key != 'auto' else 'auto',
             'model': model_override,
-            'max_tool_rounds': 10,
+            'max_tool_rounds': max_rounds,
             'max_parallel_tools': 3,
+            'context_limit': context_budget,
             'inject_datetime': True,
             'memory_scope': 'none',
             'knowledge_scope': 'none',
@@ -524,18 +701,80 @@ class PersonaDelegate:
         ctx._cancel_event = self._cancel        # Graceful cancel
         ctx._force_cancel_event = self._force_cancel  # Force cancel
 
-        # Build the delegation prompt — tells the persona they've been called in
+        # ── Build the delegation prompt ────────────────────────────────────
+        # Tells the persona who they are, what tools they have, past lessons,
+        # team context, and the actual task.
+
+        # Resolve what tools this delegate actually has (for self-awareness)
+        tool_list_str = ""
+        try:
+            from core.toolsets import toolset_manager
+            if self.toolset == "all":
+                tool_list_str = "(full toolset — all tools available)"
+            elif toolset_manager.toolset_exists(self.toolset):
+                fn_names = toolset_manager.get_toolset_functions(self.toolset)
+                if fn_names:
+                    tool_list_str = ", ".join(fn_names[:20])
+                    if len(fn_names) > 20:
+                        tool_list_str += f" ... and {len(fn_names) - 20} more"
+        except Exception:
+            pass
+
         delegation_prompt = (
             f"[Team Delegation]\n"
             f"You've been called in to help with a task. You are {self.display_name}.\n"
-            f"Stay fully in character. Start with a brief in-character acknowledgment "
-            f"(1-2 sentences showing your personality).\n"
-            f"Then do the actual work using your available tools.\n"
-            f"When done, give your results followed by a brief in-character sign-off.\n\n"
-            f"TASK: {self.task}"
+            f"Stay fully in character throughout.\n\n"
+            f"YOUR WORKFLOW — follow these steps IN ORDER:\n"
+            f"1. ACKNOWLEDGE: Brief in-character greeting (1-2 sentences showing personality)\n"
+            f"2. CHECK LESSONS: Read your [Past Experience] section below (if any). Adapt your approach based on what you've learned before.\n"
+            f"3. DO THE WORK: Use your tools to complete the task.\n"
+            f"4. SHARE: If you found something other team members need, call shared_context_write.\n"
+            f"5. REFLECT: Before signing off, call record_lesson for EACH of these you encountered:\n"
+            f"   - Something that FAILED or was unexpected (category='temporary' if transient, 'session' if ongoing)\n"
+            f"   - A trick/workaround that WORKED (category='session' or 'permanent')\n"
+            f"   - A system/tool quirk worth remembering (category='permanent')\n"
+            f"   If the task was straightforward and nothing surprising happened, skip this step.\n"
+            f"6. REPORT: Give your results with a brief in-character sign-off.\n\n"
+            f"⚠️ CRITICAL — NEVER FABRICATE:\n"
+            f"- If you CANNOT access content (video, paywalled site, broken link), say so CLEARLY.\n"
+            f"- NEVER invent timestamps, quotes, summaries, or data you didn't actually retrieve.\n"
+            f"- 'I couldn't access this' is ALWAYS better than a made-up answer.\n"
+            f"- If a tool returns an error or empty result, report what happened honestly.\n"
+            f"- Partial info is fine — just label what's confirmed vs what you couldn't verify.\n"
         )
+
+        # Self-awareness: tell the delegate what tools they have
+        if tool_list_str:
+            delegation_prompt += (
+                f"\n[Your Tools]\n"
+                f"Toolset: {self.toolset}\n"
+                f"Available: {tool_list_str}\n"
+                f"Use ONLY these tools. Do not attempt to call tools you don't have.\n"
+            )
+
+        # Inject skills definition (role, guidelines, boundaries)
+        skills_block = _skills_get_prompt(self.persona_name)
+        if skills_block:
+            delegation_prompt += f"\n\n{skills_block}\n"
+
+        delegation_prompt += f"\nTASK: {self.task}"
+
         if self.context:
             delegation_prompt += f"\n\nCONTEXT: {self.context}"
+
+        # Inject past lessons for this persona (persistent learning)
+        lessons_block = _lessons_get_prompt(self.persona_name)
+        if lessons_block:
+            delegation_prompt += f"\n\n{lessons_block}"
+
+        # Inject shared context from other delegates
+        with _lock:
+            team_ctx = _shared_ctx.get(self.chat_name, {})
+        if team_ctx:
+            ctx_lines = ["[Team Findings — shared by other agents]"]
+            for key, entry in team_ctx.items():
+                ctx_lines.append(f"  {key} (from {entry['author']}): {entry['value']}")
+            delegation_prompt += "\n\n" + "\n".join(ctx_lines)
 
         log_event("EXEC", f"{self.persona_name} starting execution (toolset={self.toolset}, provider={provider_key})")
 
@@ -746,6 +985,21 @@ def execute(function_name, arguments, config, plugin_settings=None):
 
     elif function_name == 'send_message':
         return _send_message(arguments)
+
+    elif function_name == 'shared_context_write':
+        return _shared_context_write(arguments)
+
+    elif function_name == 'shared_context_read':
+        return _shared_context_read(arguments)
+
+    elif function_name == 'sub_delegate':
+        return _sub_delegate(arguments)
+
+    elif function_name == 'record_lesson':
+        return _record_lesson(arguments)
+
+    elif function_name == 'contradict_lesson':
+        return _contradict_lesson(arguments)
 
     return f"Unknown function: {function_name}", False
 
@@ -1139,3 +1393,211 @@ def _send_message(arguments):
         f"{result}",
         True
     )
+
+
+# ── Shared Context (Team Scratchpad) ─────────────────────────────────────────
+
+def _shared_context_write(arguments):
+    """Write to the shared team scratchpad."""
+    key = arguments.get('key', '').strip()
+    value = arguments.get('value', '').strip()
+
+    if not key:
+        return "ERROR: key is required.", False
+    if not value:
+        return "ERROR: value is required.", False
+
+    chat_name = _get_active_chat()
+
+    with _lock:
+        if chat_name not in _shared_ctx:
+            _shared_ctx[chat_name] = {}
+
+        # Detect author from current delegate context
+        author = 'unknown'
+        for d in _delegates.values():
+            if d.status == 'running' and d.chat_name == chat_name:
+                author = d.display_name
+                break
+
+        _shared_ctx[chat_name][key] = {
+            'value': value,
+            'author': author,
+            'timestamp': datetime.now().isoformat(),
+        }
+
+    log_event("SHARED-CTX", f"{author} wrote '{key}' ({len(value)} chars)")
+    return f"Shared context updated: '{key}' is now available to all team members.", True
+
+
+def _shared_context_read(arguments=None):
+    """Read the shared team scratchpad."""
+    chat_name = _get_active_chat()
+
+    with _lock:
+        ctx = _shared_ctx.get(chat_name, {})
+
+    if not ctx:
+        return "Shared scratchpad is empty. No team members have shared any findings yet.", True
+
+    lines = ["[Team Scratchpad]"]
+    for key, entry in ctx.items():
+        author = entry.get('author', '?')
+        ts = entry.get('timestamp', '')
+        ts_short = ts[11:19] if len(ts) > 19 else ts  # HH:MM:SS
+        value = entry.get('value', '')
+        lines.append(f"  \u2022 {key} (by {author} at {ts_short}):")
+        lines.append(f"    {value}")
+        lines.append("")
+
+    return '\n'.join(lines), True
+
+
+# ── Sub-delegation (Hierarchy) ──────────────────────────────────────────────
+
+# Track sub-delegation depth to prevent infinite recursion
+_SUB_DELEGATE_DEPTH = threading.local()
+MAX_SUB_DEPTH = 2  # A sub-delegate can spawn one more level, but no deeper
+
+
+def _sub_delegate(arguments):
+    """Spawn a helper agent for a sub-task. Lighter-weight than delegate_task."""
+    persona_name = arguments.get('persona', '').strip().lower()
+    task = arguments.get('task', '').strip()
+
+    if not persona_name:
+        available = ', '.join(_list_all_personas())
+        return f"ERROR: persona name is required. Available personas: {available}", False
+    if not task:
+        return "ERROR: task description is required.", False
+
+    # Check recursion depth
+    current_depth = getattr(_SUB_DELEGATE_DEPTH, 'depth', 0)
+    if current_depth >= MAX_SUB_DEPTH:
+        return "ERROR: Maximum sub-delegation depth reached. Complete this task yourself.", False
+
+    # Load persona
+    persona_data = _load_persona(persona_name)
+    if not persona_data:
+        available = ', '.join(_list_all_personas())
+        return f"ERROR: Persona '{persona_name}' not found. Available: {available}", False
+
+    # Prevent sub-delegating to coordinators (that would be weird hierarchy)
+    settings = persona_data.get('settings', {})
+    persona_toolset = settings.get('toolset', '') or 'conversation'
+    tool_names = []
+    try:
+        from core.toolsets import toolset_manager
+        if persona_toolset == "all":
+            tool_names = ['run_command', 'web_search']
+        elif toolset_manager.toolset_exists(persona_toolset):
+            tool_names = toolset_manager.get_toolset_functions(persona_toolset)
+    except Exception:
+        pass
+
+    if 'delegate_task' in tool_names:
+        return f"ERROR: Cannot sub-delegate to a coordinator ({persona_name}). Pick a specialist.", False
+
+    chat_name = _get_active_chat()
+    delegate_id = uuid.uuid4().hex[:8]
+
+    delegate = PersonaDelegate(
+        delegate_id=delegate_id,
+        persona_name=persona_name,
+        persona_data=persona_data,
+        task=task,
+        toolset=persona_toolset,
+        context=f"(Sub-task from another specialist, depth={current_depth + 1})",
+        chat_name=chat_name,
+    )
+
+    with _lock:
+        _delegates[delegate_id] = delegate
+
+    log_event("SUB-DELEGATE", f"Sub-delegation to {persona_name} (depth={current_depth + 1}): {task[:80]}")
+
+    # Run inline (blocking) with reduced tool rounds
+    original_execute = delegate._execute
+
+    def _limited_execute():
+        _SUB_DELEGATE_DEPTH.depth = current_depth + 1
+        try:
+            original_execute()
+        finally:
+            _SUB_DELEGATE_DEPTH.depth = current_depth
+
+    delegate._execute = _limited_execute
+    delegate.start()
+
+    # Wait synchronously (sub-delegates should be quick)
+    MAX_WAIT = 120  # 2 minute cap for sub-tasks
+    poll_interval = 0.5
+    waited = 0.0
+    while delegate.status == 'running' and waited < MAX_WAIT:
+        time.sleep(poll_interval)
+        waited += poll_interval
+
+    if delegate.status == 'running':
+        delegate.cancel(force=True)
+        return f"{delegate.display_name} timed out on sub-task (>{MAX_WAIT}s). Proceeding without their input.", True
+
+    tools_used = ', '.join(delegate.tool_log) if delegate.tool_log else 'none'
+    result = delegate.result or delegate.error or '(No result)'
+
+    # Clean up — sub-delegates don't persist for continuation
+    with _lock:
+        _delegates.pop(delegate_id, None)
+
+    status_icon = '\u2705' if delegate.status == 'done' else '\u274c'
+    return (
+        f"{status_icon} Sub-task [{delegate.display_name}] — {delegate.status} in {delegate.elapsed}s | tools: {tools_used}\n\n"
+        f"{result}",
+        True
+    )
+
+
+# ── Agent Lessons (Persistent Learning) ────────────────────────────────────
+
+def _record_lesson(arguments):
+    """Record a lesson learned by the currently running delegate."""
+    lesson_text = arguments.get('lesson', '').strip()
+    category = arguments.get('category', 'session').strip().lower()
+
+    if not lesson_text:
+        return "ERROR: lesson text is required.", False
+
+    if category not in ('temporary', 'session', 'permanent'):
+        category = 'session'
+
+    # Figure out which persona is calling this — find the running delegate
+    chat_name = _get_active_chat()
+    persona_name = 'unknown'
+    with _lock:
+        for d in _delegates.values():
+            if d.status == 'running' and d.chat_name == chat_name:
+                persona_name = d.persona_name
+                break
+
+    _lessons_record(persona_name, lesson_text, category)
+
+    ttl_label = {'temporary': '24 hours', 'session': '7 days', 'permanent': '90 days'}.get(category, '7 days')
+    return f"Lesson recorded ({category}, expires in {ttl_label}). You'll see this next time you're activated.", True
+
+
+def _contradict_lesson(arguments):
+    """Mark a past lesson as wrong or outdated."""
+    lesson_text = arguments.get('lesson', '').strip()
+
+    if not lesson_text:
+        return "ERROR: lesson text is required.", False
+
+    chat_name = _get_active_chat()
+    persona_name = 'unknown'
+    with _lock:
+        for d in _delegates.values():
+            if d.status == 'running' and d.chat_name == chat_name:
+                persona_name = d.persona_name
+                break
+
+    _lessons_contradict(persona_name, lesson_text)
+    return f"Lesson weakened. If contradicted again it will be removed automatically.", True

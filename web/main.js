@@ -1432,10 +1432,11 @@ function _onToolExecuting(toolName) {
     if (toolName === 'delegate_task') {
         // Finalize pre-delegation text as its own segment
         if (_liveAccumulator.trim()) {
-            const stripped = _stripThink(_liveAccumulator);
+            const { thinking, visible } = _extractThink(_liveAccumulator);
             _liveSegments.push({
                 kind: 'lead_text',
-                text: stripped,
+                text: visible,
+                thinking: thinking || '',
                 rawText: _liveAccumulator,
                 timestamp: _liveSegmentStart,
                 hasDelegation: true,
@@ -1461,11 +1462,12 @@ function _endLiveTurn() {
 
     // Finalize any remaining accumulated text as the final segment
     if (_liveAccumulator.trim()) {
-        const stripped = _stripThink(_liveAccumulator);
-        if (stripped) {
+        const { thinking, visible } = _extractThink(_liveAccumulator);
+        if (visible) {
             _liveSegments.push({
                 kind: 'lead_summary',
-                text: stripped,
+                text: visible,
+                thinking: thinking || '',
                 rawText: _liveAccumulator,
                 timestamp: _liveSegmentStart,
             });
@@ -1826,16 +1828,24 @@ let _editorSelectedToolset = '';     // Currently selected toolset name
 let _editorCheckedFns = new Set();   // Currently checked function names
 let _editorOriginalFns = new Set();  // Original functions (to detect changes)
 
+let _editorSkillsContent = '';  // Skills markdown content
+let _editorSkillsOriginal = ''; // Original skills (to detect changes)
+let _editorActiveTab = 'tools'; // 'tools' or 'skills'
+
 function _openToolsetEditor(persona) {
     _editorPersona = persona;
     _editorSelectedToolset = persona.toolset || 'conversation';
+    _editorActiveTab = 'tools';
     // Fetch toolsets + functions in parallel, then render
     Promise.all([
         fetch('/api/toolsets').then(r => r.json()),
         fetch('/api/functions').then(r => r.json()),
-    ]).then(([tsData, fnData]) => {
+        fetch(`${API}/skills?persona=${encodeURIComponent(persona.name)}`).then(r => r.json()).catch(() => ({content: ''})),
+    ]).then(([tsData, fnData, skillsData]) => {
         _editorToolsets = tsData.toolsets || [];
         _editorFunctions = fnData.modules || {};
+        _editorSkillsContent = skillsData.content || '';
+        _editorSkillsOriginal = _editorSkillsContent;
         // Set initial checked state from persona's current toolset
         const ts = _editorToolsets.find(t => t.name === _editorSelectedToolset);
         _editorCheckedFns = new Set(ts ? ts.functions : []);
@@ -1871,6 +1881,10 @@ function _renderEditorModal() {
 
     const overlay = document.createElement('div');
     overlay.id = 'pa-editor-overlay';
+    const skillsHasContent = _editorSkillsContent.trim().length > 0;
+    const toolsActive = _editorActiveTab === 'tools';
+    const skillsActive = _editorActiveTab === 'skills';
+
     overlay.innerHTML = `
         <div class="pa-editor-modal">
             <div class="pa-editor-header" style="border-bottom-color: ${color}">
@@ -1883,19 +1897,39 @@ function _renderEditorModal() {
                 <button class="pa-editor-close" id="pa-editor-close">\u2715</button>
             </div>
 
-            <div class="pa-editor-toolset-row">
-                <label class="pa-editor-label">Toolset</label>
-                <select class="pa-editor-select" id="pa-editor-toolset-select">${tsOpts}</select>
-                <span class="pa-editor-tool-count" id="pa-editor-tool-count">${checkedCount} tools active</span>
+            <div class="pa-editor-tabs">
+                <button class="pa-editor-tab ${toolsActive ? 'pa-tab-active' : ''}" data-tab="tools">
+                    \u{1F527} Tools <span class="pa-tab-badge">${checkedCount}</span>
+                </button>
+                <button class="pa-editor-tab ${skillsActive ? 'pa-tab-active' : ''}" data-tab="skills">
+                    \u{1F4CB} Skills ${skillsHasContent ? '<span class="pa-tab-dot"></span>' : ''}
+                </button>
             </div>
 
-            <div class="pa-editor-search-row">
-                <input type="text" class="pa-editor-search" id="pa-editor-search"
-                       placeholder="Search tools..." autocomplete="off">
+            <div class="pa-editor-tab-content" id="pa-editor-tab-tools" style="display:${toolsActive ? 'flex' : 'none'}">
+                <div class="pa-editor-toolset-row">
+                    <label class="pa-editor-label">Toolset</label>
+                    <select class="pa-editor-select" id="pa-editor-toolset-select">${tsOpts}</select>
+                    <span class="pa-editor-tool-count" id="pa-editor-tool-count">${checkedCount} tools active</span>
+                </div>
+
+                <div class="pa-editor-search-row">
+                    <input type="text" class="pa-editor-search" id="pa-editor-search"
+                           placeholder="Search tools..." autocomplete="off">
+                </div>
+
+                <div class="pa-editor-body" id="pa-editor-body">
+                    ${groupsHtml}
+                </div>
             </div>
 
-            <div class="pa-editor-body" id="pa-editor-body">
-                ${groupsHtml}
+            <div class="pa-editor-tab-content" id="pa-editor-tab-skills" style="display:${skillsActive ? 'flex' : 'none'}">
+                <div class="pa-editor-skills-hint">
+                    Define this persona's role, tool guidelines, and boundaries. This is injected into their delegation prompt so they know their job.
+                </div>
+                <textarea class="pa-editor-skills-textarea" id="pa-editor-skills-textarea"
+                    placeholder="# ${_esc(p.display_name || p.name)} — Role Title\n\n## Your Role\nDescribe what this persona specializes in...\n\n## When to Use Your Tools\n- **tool_name**: When and how to use it\n\n## What You Should NOT Do\n- Boundaries and limitations"
+                >${_esc(_editorSkillsContent)}</textarea>
             </div>
 
             <div class="pa-editor-footer">
@@ -1918,6 +1952,19 @@ function _renderEditorModal() {
     overlay.querySelector('#pa-editor-cancel').addEventListener('click', () => _closeEditor());
     overlay.addEventListener('click', e => { if (e.target === overlay) _closeEditor(); });
 
+    // Tab switching
+    overlay.querySelectorAll('.pa-editor-tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+            const tabName = tab.dataset.tab;
+            _editorActiveTab = tabName;
+            overlay.querySelectorAll('.pa-editor-tab').forEach(t => t.classList.remove('pa-tab-active'));
+            tab.classList.add('pa-tab-active');
+            overlay.querySelectorAll('.pa-editor-tab-content').forEach(c => c.style.display = 'none');
+            const target = overlay.querySelector(`#pa-editor-tab-${tabName}`);
+            if (target) target.style.display = 'flex';
+        });
+    });
+
     overlay.querySelector('#pa-editor-toolset-select').addEventListener('change', e => {
         _editorSelectToolset(e.target.value);
     });
@@ -1925,6 +1972,15 @@ function _renderEditorModal() {
     overlay.querySelector('#pa-editor-search').addEventListener('input', e => {
         _editorFilterTools(e.target.value);
     });
+
+    // Skills textarea change tracking
+    const skillsTextarea = overlay.querySelector('#pa-editor-skills-textarea');
+    if (skillsTextarea) {
+        skillsTextarea.addEventListener('input', () => {
+            _editorSkillsContent = skillsTextarea.value;
+            _updateEditorState();
+        });
+    }
 
     overlay.querySelector('#pa-editor-save').addEventListener('click', () => _editorSave());
     overlay.querySelector('#pa-editor-save-as').addEventListener('click', () => _editorSaveAs());
@@ -2030,8 +2086,10 @@ function _updateEditorState() {
     if (countEl) countEl.textContent = `${_editorCheckedFns.size} tools active`;
 
     const dirty = document.getElementById('pa-editor-dirty');
-    const hasChanges = !_setsEqual(_editorCheckedFns, _editorOriginalFns) ||
-                       _editorSelectedToolset !== (_editorPersona?.toolset || 'conversation');
+    const toolsChanged = !_setsEqual(_editorCheckedFns, _editorOriginalFns) ||
+                         _editorSelectedToolset !== (_editorPersona?.toolset || 'conversation');
+    const skillsChanged = _editorSkillsContent !== _editorSkillsOriginal;
+    const hasChanges = toolsChanged || skillsChanged;
     if (dirty) dirty.classList.toggle('pa-visible', hasChanges);
 
     // Update group counts
@@ -2078,6 +2136,16 @@ async function _editorSave() {
                 headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF() },
                 body: JSON.stringify({ settings: fullSettings }),
             });
+        }
+
+        // Save skills if changed
+        if (_editorSkillsContent !== _editorSkillsOriginal) {
+            await fetch(`${API}/skills`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': CSRF() },
+                body: JSON.stringify({ persona: personaName, content: _editorSkillsContent }),
+            });
+            _editorSkillsOriginal = _editorSkillsContent;
         }
 
         _closeEditor();
@@ -2665,6 +2733,43 @@ details[open].pa-think-block > .pa-think-summary::before { transform: rotate(90d
     cursor: pointer; padding: 4px 8px; border-radius: 4px; transition: color 0.15s;
 }
 .pa-editor-close:hover { color: #fff; }
+
+.pa-editor-tabs {
+    display: flex; gap: 0; border-bottom: 1px solid #1a1a24;
+    padding: 0 20px;
+}
+.pa-editor-tab {
+    background: none; border: none; color: #555; font-size: 0.82rem;
+    padding: 10px 16px; cursor: pointer; border-bottom: 2px solid transparent;
+    transition: color 0.15s, border-color 0.15s; font-weight: 600;
+    display: flex; align-items: center; gap: 6px;
+}
+.pa-editor-tab:hover { color: #aaa; }
+.pa-editor-tab.pa-tab-active { color: #ccc; border-bottom-color: #4a9eff; }
+.pa-tab-badge {
+    background: #1a1a2e; color: #4a9eff; font-size: 0.68rem;
+    padding: 1px 6px; border-radius: 8px; font-weight: 700;
+}
+.pa-tab-dot {
+    display: inline-block; width: 6px; height: 6px; background: #4a9eff;
+    border-radius: 50%;
+}
+.pa-editor-tab-content {
+    flex: 1; display: flex; flex-direction: column; overflow: hidden; min-height: 0;
+}
+
+.pa-editor-skills-hint {
+    padding: 12px 20px 8px; font-size: 0.75rem; color: #666; line-height: 1.4;
+}
+.pa-editor-skills-textarea {
+    flex: 1; margin: 0 16px 12px; padding: 12px 14px;
+    background: #111118; border: 1px solid #2a2a3a; border-radius: 8px;
+    color: #ccc; font-size: 0.82rem; font-family: 'Cascadia Code', 'Fira Code', monospace;
+    line-height: 1.5; resize: none; outline: none; min-height: 250px;
+    transition: border-color 0.15s;
+}
+.pa-editor-skills-textarea:focus { border-color: #4a9eff; }
+.pa-editor-skills-textarea::placeholder { color: #333; }
 
 .pa-editor-toolset-row {
     display: flex; align-items: center; gap: 10px;

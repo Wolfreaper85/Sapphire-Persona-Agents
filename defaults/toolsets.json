@@ -36,6 +36,7 @@
     "functions": [
       "web_search",
       "get_website",
+      "get_youtube_transcript",
       "get_wikipedia",
       "research_topic",
       "get_site_links",
@@ -49,7 +50,12 @@
       "notepad_read",
       "notepad_append_lines",
       "notepad_insert_line",
-      "notepad_delete_lines"
+      "notepad_delete_lines",
+      "shared_context_write",
+      "shared_context_read",
+      "sub_delegate",
+      "record_lesson",
+      "contradict_lesson"
     ]
   },
   "pa_engineer": {
@@ -71,7 +77,12 @@
       "delete_knowledge",
       "search_memory",
       "save_memory",
-      "get_time"
+      "get_time",
+      "shared_context_write",
+      "shared_context_read",
+      "sub_delegate",
+      "record_lesson",
+      "contradict_lesson"
     ]
   },
   "pa_sysadmin": {
@@ -93,7 +104,12 @@
       "get_recent_memories",
       "get_time",
       "list_tools",
-      "search_help_docs"
+      "search_help_docs",
+      "shared_context_write",
+      "shared_context_read",
+      "sub_delegate",
+      "record_lesson",
+      "contradict_lesson"
     ]
   }
 }

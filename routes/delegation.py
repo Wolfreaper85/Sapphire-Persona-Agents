@@ -191,3 +191,86 @@ async def save_settings(**kwargs):
         shared._auto_continue = _plugin_settings["auto_continue"]
 
     return {"success": True, **_plugin_settings}
+
+
+# ── Agent Skills (per-persona skill definitions) ──────────────────────────
+
+def _get_skills_mod():
+    """Get the agent_skills module."""
+    import sys
+    return sys.modules.get("persona_agents_skills")
+
+
+async def get_skills(**kwargs):
+    """Get a persona's skills.md content."""
+    query = kwargs.get("query", {})
+    persona = query.get("persona", "").strip().lower()
+
+    if not persona:
+        return {"error": "persona parameter required", "content": ""}
+
+    mod = _get_skills_mod()
+    if not mod:
+        # Try loading directly
+        try:
+            from pathlib import Path
+            skills_dir = Path(__file__).parent.parent.parent.parent / 'user' / 'personas' / 'skills'
+            path = skills_dir / f"{persona}.md"
+            content = path.read_text(encoding='utf-8').strip() if path.exists() else ""
+            return {"persona": persona, "content": content}
+        except Exception as e:
+            return {"persona": persona, "content": "", "error": str(e)}
+
+    content = mod.get_skills(persona)
+    return {"persona": persona, "content": content}
+
+
+async def save_skills(**kwargs):
+    """Save a persona's skills.md content."""
+    body = kwargs.get("body", {})
+    persona = body.get("persona", "").strip().lower()
+    content = body.get("content", "")
+
+    if not persona:
+        return {"error": "persona parameter required", "success": False}
+
+    mod = _get_skills_mod()
+    if not mod:
+        # Try saving directly
+        try:
+            from pathlib import Path
+            skills_dir = Path(__file__).parent.parent.parent.parent / 'user' / 'personas' / 'skills'
+            skills_dir.mkdir(parents=True, exist_ok=True)
+            path = skills_dir / f"{persona}.md"
+            if content.strip():
+                path.write_text(content.strip() + "\n", encoding='utf-8')
+            elif path.exists():
+                path.unlink()
+            return {"success": True, "persona": persona}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    if content.strip():
+        ok = mod.save_skills(persona, content)
+    else:
+        ok = mod.delete_skills(persona)
+    return {"success": ok, "persona": persona}
+
+
+async def list_skills(**kwargs):
+    """List all personas that have skills files."""
+    mod = _get_skills_mod()
+    if not mod:
+        try:
+            from pathlib import Path
+            skills_dir = Path(__file__).parent.parent.parent.parent / 'user' / 'personas' / 'skills'
+            if not skills_dir.exists():
+                return {"skills": {}}
+            return {"skills": {
+                p.stem: p.read_text(encoding='utf-8').strip()
+                for p in skills_dir.glob("*.md") if p.is_file()
+            }}
+        except Exception as e:
+            return {"skills": {}, "error": str(e)}
+
+    return {"skills": mod.list_all_skills()}
