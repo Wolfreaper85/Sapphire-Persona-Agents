@@ -301,13 +301,15 @@ def generate_skills(persona_name):
     has_smarthome = 'ha_activate' in tool_names or 'ha_set_light' in tool_names
     has_browser = 'tandem_browse' in tool_names
     has_persona_create = 'create_full_persona' in tool_names
-    has_finance = 'save_knowledge' in tool_names and has_research
+    # Detect financial toolset by checking the toolset name directly
+    # (save_knowledge is in most toolsets, so tool-presence alone is unreliable)
+    is_finance_toolset = toolset in ('pa_financial', 'financial', 'finance')
 
     # Determine primary role
     if has_smarthome:
         role = "Smart Home Controller"
         role_desc = "You control smart home devices — lights, thermostat, switches, and automations."
-    elif has_finance:
+    elif is_finance_toolset:
         role = "Financial Analyst"
         role_desc = "You research investments, analyze markets, and track portfolio performance."
     elif has_network and has_commands and not has_research:
