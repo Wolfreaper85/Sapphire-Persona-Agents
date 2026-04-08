@@ -5,6 +5,7 @@
 
 import { registerView, switchView } from '/static/core/router.js';
 import * as eventBus from '/static/core/event-bus.js';
+import * as audio from '/static/audio.js';
 
 const CSRF = () => document.querySelector('meta[name="csrf-token"]')?.content || '';
 const API = '/api/plugin/persona-agents';
@@ -21,6 +22,16 @@ export default {
             hide: () => _stopListening(),
         });
         _setupToastNotifications();
+
+        // TTS state — always listen, even when view is hidden
+        eventBus.on('tts_playing', () => {
+            _ttsPlaying = true;
+            _updateBarTtsState();
+        });
+        eventBus.on('tts_stopped', () => {
+            _ttsPlaying = false;
+            _updateBarTtsState();
+        });
     }
 };
 
@@ -293,6 +304,7 @@ function _renderRoster() {
 
 function _startListening() {
     _viewVisible = true;
+
     // Subscribe to delegation events via SSE event bus
     _unsubscribers.push(
         // ── Core turn lifecycle ──
@@ -443,6 +455,51 @@ function _renderTranscript(chatMessages, delTranscript, activeDelegates) {
             continue;
         }
 
+        // For assistant messages with delegate_task calls, split into
+        // pre-delegation and post-delegation segments so they sort
+        // correctly around the delegate results in the timeline
+        if (msg.role === 'assistant' && msg.parts) {
+            const firstDelegateIdx = msg.parts.findIndex(p => p.type === 'tool_call' && p.name === 'delegate_task');
+            if (firstDelegateIdx !== -1) {
+                // Pre-delegation content (thinking + initial text before first delegate_task)
+                const preParts = msg.parts.slice(0, firstDelegateIdx).filter(p => p.type === 'content' && p.text);
+                if (preParts.length) {
+                    const preText = preParts.map(p => {
+                        const ex = _extractThink(p.text);
+                        return ex.visible;
+                    }).filter(Boolean).join('\n');
+                    const preThink = preParts.map(p => _extractThink(p.text).thinking).filter(Boolean).join('\n');
+                    if (preText || preThink) {
+                        timeline.push({
+                            sort_time: msg.timestamp || '',
+                            kind: 'segment',
+                            data: { kind: 'lead_text', text: preText, thinking: preThink, rawText: preParts.map(p => p.text).join('\n'), timestamp: msg.timestamp },
+                        });
+                    }
+                }
+
+                // Post-delegation content (summary after last delegate result)
+                const lastDelegateResultIdx = msg.parts.map((p, i) => ({ p, i }))
+                    .filter(x => x.p.type === 'tool_result' && x.p.name === 'delegate_task')
+                    .pop()?.i ?? -1;
+                if (lastDelegateResultIdx !== -1) {
+                    const postParts = msg.parts.slice(lastDelegateResultIdx + 1).filter(p => p.type === 'content' && p.text);
+                    if (postParts.length) {
+                        const postText = postParts.map(p => _extractThink(p.text).visible).filter(Boolean).join('\n');
+                        const sortTime = postParts[0]?.timestamp || msg.parts[lastDelegateResultIdx]?.timestamp || msg.timestamp || '';
+                        if (postText) {
+                            timeline.push({
+                                sort_time: sortTime,
+                                kind: 'segment',
+                                data: { kind: 'lead_summary', text: postText, rawText: postParts.map(p => p.text).join('\n'), timestamp: sortTime },
+                            });
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+
         timeline.push({ sort_time: msg.timestamp || '', kind: 'chat', data: msg });
     }
 
@@ -536,6 +593,12 @@ function _renderSegment(seg) {
     const label = seg.kind === 'lead_summary' ? 'Summary' : '';
     const labelTag = label ? `<span class="pa-chat-tools">${label}</span>` : '';
 
+    const thinkHtml = seg.thinking ? `
+                <details class="pa-think-block">
+                    <summary class="pa-think-summary">\u{1F4AD} Thinking</summary>
+                    <div class="pa-think-content">${_esc(seg.thinking).replace(/\n/g, '<br>')}</div>
+                </details>` : '';
+
     return `<div class="pa-chat-msg pa-chat-assistant">
         <div class="pa-chat-bubble pa-bubble-assistant" style="border-left-color:${color}">
             <div class="pa-chat-role">
@@ -544,8 +607,13 @@ function _renderSegment(seg) {
                 <span style="color:${color}">${_esc(displayName)}</span>
                 ${labelTag}
                 ${ts ? `<span class="pa-chat-time">${ts}</span>` : ''}
+                <span class="pa-msg-actions">
+                    <button class="pa-action-btn pa-copy-btn" title="Copy">\u{1F4CB}</button>
+                    <button class="pa-action-btn pa-tts-msg-btn" title="Play TTS">\u{1F50A}</button>
+                </span>
             </div>
-            <div class="pa-chat-text">${_esc(seg.text).replace(/\n/g, '<br>')}</div>
+            ${thinkHtml}
+            ${seg.text ? `<div class="pa-chat-text">${_esc(seg.text).replace(/\n/g, '<br>')}</div>` : ''}
         </div>
     </div>`;
 }
@@ -1229,10 +1297,10 @@ async function _deleteFromButton(btn) {
     }
 }
 
-function _ttsMsgFromButton(btn) {
-    // If already playing, stop
+async function _ttsMsgFromButton(btn) {
+    // If TTS is playing (tracked via SSE events), stop it
     if (_ttsPlaying) {
-        _stopTts();
+        await _stopTts();
         return;
     }
     const bubble = btn.closest('.pa-chat-bubble');
@@ -1438,6 +1506,21 @@ function _updateLiveBubble() {
     const leadName = _getLeadName();
     const leadDisplay = _getLeadDisplayName();
 
+    // Build HTML for any already-saved segments (pre-delegation text)
+    let priorSegmentsHtml = '';
+    for (const seg of _liveSegments) {
+        if (seg.kind === 'lead_text' && seg.rawText) {
+            const { thinking: segThink, visible: segVis } = _extractThink(seg.rawText);
+            const segThinkHtml = segThink ? `
+                <details class="pa-think-block" open>
+                    <summary>\u{1F4AD} Thinking</summary>
+                    <div class="pa-think-text">${_esc(segThink).replace(/\n/g, '<br>')}</div>
+                </details>` : '';
+            const segVisHtml = segVis ? `<div class="pa-chat-text">${_esc(segVis).replace(/\n/g, '<br>')}</div>` : '';
+            priorSegmentsHtml += segThinkHtml + segVisHtml;
+        }
+    }
+
     const headerHtml = `
         <div class="pa-chat-role">
             <img class="pa-chat-avatar" src="/api/personas/${leadName}/avatar"
@@ -1453,18 +1536,27 @@ function _updateLiveBubble() {
             <div class="pa-think-live-text">${_esc(thinking).replace(/\n/g, '<br>')}</div>
         </div>` : '';
 
-    if (!visible && !thinking) {
+    if (!visible && !thinking && !priorSegmentsHtml) {
         // Nothing yet — show typing dots
         bubble.innerHTML = `
             <div class="pa-chat-bubble pa-bubble-assistant" style="border-left-color:${leadColor}">
                 ${headerHtml}
                 <div class="pa-typing"><span class="pa-typing-dots"><span>.</span><span>.</span><span>.</span></span></div>
             </div>`;
+    } else if (!visible && !thinking && priorSegmentsHtml) {
+        // Pre-delegation content saved, now waiting for delegate — show prior + dots
+        bubble.innerHTML = `
+            <div class="pa-chat-bubble pa-bubble-assistant" style="border-left-color:${leadColor}">
+                ${headerHtml}
+                ${priorSegmentsHtml}
+                <div class="pa-typing"><span class="pa-typing-dots"><span>.</span><span>.</span><span>.</span></span> Delegating...</div>
+            </div>`;
     } else if (!visible && thinking) {
         // Still in thinking — show live thoughts
         bubble.innerHTML = `
             <div class="pa-chat-bubble pa-bubble-assistant" style="border-left-color:${leadColor}">
                 ${headerHtml}
+                ${priorSegmentsHtml}
                 ${liveThinkHtml}
                 <div class="pa-typing"><span class="pa-typing-dots"><span>.</span><span>.</span><span>.</span></span></div>
             </div>`;
@@ -1473,6 +1565,7 @@ function _updateLiveBubble() {
         bubble.innerHTML = `
             <div class="pa-chat-bubble pa-bubble-assistant" style="border-left-color:${leadColor}">
                 ${headerHtml}
+                ${priorSegmentsHtml}
                 ${liveThinkHtml}
                 <div class="pa-chat-text">${_esc(visible).replace(/\n/g, '<br>')}</div>
             </div>`;
@@ -1568,28 +1661,48 @@ async function _orbNudge() {
 let _ttsPlaying = false;  // Track server-side TTS state
 
 async function _stopTts() {
-    try {
-        await fetch('/api/tts/stop', {
-            method: 'POST',
-            headers: { 'X-CSRF-Token': CSRF() },
-        });
-    } catch (e) { /* ignore */ }
+    // Stop browser-side audio (main chat's Audio element) + server-side playback
+    audio.stop(true);
     _ttsPlaying = false;
+    _updateBarTtsState();
     // Clear all TTS button states
     document.querySelectorAll('.pa-tts-playing, .pa-tts-loading').forEach(el => {
         el.classList.remove('pa-tts-playing', 'pa-tts-loading');
     });
 }
 
+function _updateBarTtsState() {
+    const btn = document.getElementById('pa-bar-tts');
+    if (!btn) return;
+    if (_ttsPlaying) {
+        btn.textContent = '\u23F9';  // ⏹ stop icon
+        btn.title = 'Stop TTS';
+        btn.classList.add('pa-tts-playing');
+    } else {
+        btn.textContent = '\u{1F50A}';  // 🔊 speaker icon
+        btn.title = 'Play / stop last response TTS';
+        btn.classList.remove('pa-tts-playing');
+    }
+}
+
 async function _toggleBarTts() {
     const btn = document.getElementById('pa-bar-tts');
     if (!btn) return;
-
-    // If playing, stop
+    // If we know TTS is playing (via SSE events), stop it immediately
     if (_ttsPlaying) {
         await _stopTts();
         return;
     }
+
+    // Double-check server status as safety net (covers edge cases)
+    try {
+        const statusResp = await fetch('/api/tts/status', { headers: { 'X-CSRF-Token': CSRF() } });
+        const statusData = await statusResp.json().catch(() => ({}));
+        if (statusData.playing) {
+            await _stopTts();
+            return;
+        }
+    } catch (e) { /* proceed to play */ }
 
     // Find last assistant message in transcript
     const container = document.getElementById('pa-transcript');

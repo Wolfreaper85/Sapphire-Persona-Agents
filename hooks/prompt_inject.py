@@ -130,16 +130,21 @@ def _inject_roster(event):
             active_toolset = settings.get("toolset", "")
             if active_toolset and toolset_manager.toolset_exists(active_toolset):
                 active_tools = toolset_manager.get_toolset_functions(active_toolset)
-    except Exception:
-        pass
+            logger.debug(f"Active persona={active_persona!r}, toolset={active_toolset!r}, tools={len(active_tools)}")
+        else:
+            logger.debug("No system/llm_chat available")
+    except Exception as e:
+        logger.debug(f"Active persona detection failed: {e}")
 
     personas = persona_manager.get_all()
     if not personas:
+        logger.debug("No personas found, skipping roster")
         return
 
     # Only inject if the active persona is a coordinator (has delegate_task)
     # Otherwise this persona can't delegate — no point showing a roster
     if active_tools and not _is_coordinator(active_tools):
+        logger.debug(f"Skipping roster — {active_persona!r} is not a coordinator")
         return
 
     # Build candidate list, separating specialists from chat-only personas

@@ -663,9 +663,18 @@ def _delegate_task(arguments):
             False
         )
 
-    # Determine toolset: override > persona setting > fallback to 'conversation'
+    # Determine toolset: validated override > persona setting > fallback to 'conversation'
     settings = persona_data.get('settings', {})
-    toolset = toolset_override or settings.get('toolset', '') or 'conversation'
+    persona_toolset = settings.get('toolset', '') or 'conversation'
+    # Only use override if it's an actual valid toolset name
+    if toolset_override:
+        from core.toolsets import toolset_manager
+        if toolset_manager.toolset_exists(toolset_override):
+            toolset = toolset_override
+        else:
+            toolset = persona_toolset  # Invalid override — use persona's default
+    else:
+        toolset = persona_toolset
 
     # Check concurrent limit
     with _lock:
