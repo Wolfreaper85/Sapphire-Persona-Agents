@@ -576,6 +576,29 @@ def _strip_thinking(text):
     return result.strip()
 
 
+def _extract_thinking_content(text):
+    """Last-resort fallback: extract readable content from thinking tags.
+
+    When the LLM only produced <think> blocks and even the summary call failed,
+    we strip the tags and present the thinking as a best-effort report.
+    Better than returning nothing.
+    """
+    if not text:
+        return ''
+    # Pull content from inside think tags
+    chunks = re.findall(r'<think>([\s\S]*?)</think>', text)
+    if chunks:
+        content = '\n'.join(c.strip() for c in chunks if c.strip())
+    else:
+        # Maybe unclosed think tag — just strip the tag markers
+        content = re.sub(r'</?think>', '', text).strip()
+        content = re.sub(r'<\|channel>thought', '', content).strip()
+
+    if content:
+        return f"[Note: Agent ran out of tool rounds. Partial findings from their working notes:]\n\n{content}"
+    return ''
+
+
 class PersonaDelegate:
     """A persona-powered background agent."""
 
@@ -836,18 +859,75 @@ class PersonaDelegate:
         self.tool_log = ctx.tool_log
 
         # Try to strip thinking tags, but if that empties the result,
-        # keep the raw content — better to show thinking than "(No result)"
+        # the delegate probably ran out of tool rounds while still thinking.
+        # Force one more LLM call to produce a visible summary.
         result = _strip_thinking(raw) if raw else ''
         if not result and raw and raw.strip():
-            logger.info(f"[PERSONA-AGENT] {self.persona_name} think-stripping emptied result, "
-                        f"keeping raw content (len={len(raw)})")
-            result = raw.strip()
+            logger.info(f"[PERSONA-AGENT] {self.persona_name} result is thinking-only, "
+                        f"requesting summary call (raw_len={len(raw)})")
+            result = self._force_summary(ctx, raw)
 
-        self.result = result or None  # None = no result, '' would be falsy ambiguity
+        if not result:
+            result = None  # None = no result, '' would be falsy ambiguity
+
+        self.result = result
 
         # Log each tool that was called
         for tool_name in self.tool_log:
             log_tool_call(self.id, self.persona_name, tool_name)
+
+    def _force_summary(self, ctx, raw_thinking):
+        """When the delegate ran out of tool rounds and only produced thinking,
+        make one more LLM call (no tools) asking it to report what it found.
+
+        This turns the thinking content into a visible report instead of
+        returning empty or raw <think> tags to the lead.
+        """
+        try:
+            from core.chat.llm_providers import provider_manager
+
+            # Build a minimal message list: system prompt + summary request
+            messages = getattr(ctx, '_messages', []) or []
+
+            # Add a final user message forcing a visible report
+            summary_prompt = (
+                "[SYSTEM — Tool limit reached]\n"
+                "You've used all your tool rounds. You MUST now produce your final report.\n"
+                "Summarize EVERYTHING you found so far as visible text (NOT inside <think> tags).\n"
+                "Include all data, findings, and sources you gathered. Even partial results are valuable.\n"
+                "Write your report NOW — this is your last chance to communicate your findings."
+            )
+
+            summary_messages = list(messages) + [
+                {"role": "user", "content": summary_prompt}
+            ]
+
+            # Get provider and make one more call with NO tools
+            provider = provider_manager.get_provider()
+            if not provider:
+                logger.warning(f"[PERSONA-AGENT] {self.persona_name} no provider for summary call")
+                return _extract_thinking_content(raw_thinking)
+
+            response = provider.chat_completion(
+                messages=summary_messages,
+                tools=None,  # No tools — force text response
+                generation_params={'max_tokens': 2000, 'temperature': 0.7},
+            )
+
+            if response and response.content:
+                visible = _strip_thinking(response.content)
+                if visible:
+                    logger.info(f"[PERSONA-AGENT] {self.persona_name} summary call produced "
+                               f"{len(visible)} chars of visible content")
+                    return visible
+
+            # If summary call also failed, extract what we can from thinking
+            logger.warning(f"[PERSONA-AGENT] {self.persona_name} summary call produced no visible content")
+            return _extract_thinking_content(raw_thinking)
+
+        except Exception as e:
+            logger.warning(f"[PERSONA-AGENT] {self.persona_name} summary call failed: {e}")
+            return _extract_thinking_content(raw_thinking)
 
     def to_dict(self):
         return {
