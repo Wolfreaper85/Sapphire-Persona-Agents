@@ -211,6 +211,7 @@ AVAILABLE_FUNCTIONS = [
     'sub_delegate',
     'record_lesson',
     'contradict_lesson',
+    'write_agent_skills',
 ]
 
 TOOLS = [
@@ -472,6 +473,46 @@ TOOLS = [
                     }
                 },
                 "required": ["lesson"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "is_local": True,
+        "function": {
+            "name": "write_agent_skills",
+            "description": (
+                "Create or update a persona's skills.md file — the role definition, triggers, "
+                "and approach patterns that guide how the agent works.\n\n"
+                "Modes:\n"
+                "- 'auto': Auto-generate from the persona's toolset (includes YAML frontmatter, "
+                "approach patterns, tool guidelines, and boundaries). Best for initializing a new persona.\n"
+                "- 'manual': Write custom skills content exactly as provided. Use when the user "
+                "dictates specific role instructions.\n"
+                "- 'augment': Append content to the existing skills file without overwriting. "
+                "Use to add new sections or tips to an already-good skills file.\n\n"
+                "Example: write_agent_skills(persona_name='scout', mode='auto')\n"
+                "Example: write_agent_skills(persona_name='neo', mode='manual', content='# Neo — Engineer\\n...')\n"
+                "Example: write_agent_skills(persona_name='scout', mode='augment', content='## Finance Tips\\n...')"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "persona_name": {
+                        "type": "string",
+                        "description": "Name of the persona whose skills to write (e.g. 'scout', 'neo')"
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["auto", "manual", "augment"],
+                        "description": "Generation mode: 'auto' (from toolset), 'manual' (custom content), 'augment' (append to existing)"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Skills content to write (required for 'manual' and 'augment' modes, ignored for 'auto')"
+                    }
+                },
+                "required": ["persona_name"]
             }
         }
     },
@@ -1005,6 +1046,9 @@ def execute(function_name, arguments, config, plugin_settings=None):
 
     elif function_name == 'contradict_lesson':
         return _contradict_lesson(arguments)
+
+    elif function_name == 'write_agent_skills':
+        return _write_agent_skills(arguments)
 
     return f"Unknown function: {function_name}", False
 
@@ -1606,3 +1650,53 @@ def _contradict_lesson(arguments):
 
     _lessons_contradict(persona_name, lesson_text)
     return f"Lesson weakened. If contradicted again it will be removed automatically.", True
+
+
+def _write_agent_skills(arguments):
+    """Create or update a persona's skills.md file."""
+    from persona_agents_skills import get_skills, save_skills, generate_skills
+
+    persona_name = arguments.get('persona_name', '').strip().lower()
+    mode = arguments.get('mode', 'auto').strip().lower()
+    content = arguments.get('content', '').strip()
+
+    if not persona_name:
+        return "ERROR: persona_name is required.", False
+
+    # Validate persona exists
+    persona_data = _load_persona(persona_name)
+    if not persona_data:
+        available = ', '.join(_list_all_personas())
+        return f"ERROR: Persona '{persona_name}' not found. Available: {available}", False
+
+    if mode == 'auto':
+        # Auto-generate from toolset with frontmatter + approach patterns
+        generated = generate_skills(persona_name)
+        if not generated:
+            return f"ERROR: Could not auto-generate skills for '{persona_name}'. They may be a chat-only persona.", False
+        if save_skills(persona_name, generated):
+            return f"Skills auto-generated for '{persona_name}' with role metadata, triggers, and approach patterns.", True
+        return f"ERROR: Failed to save skills for '{persona_name}'.", False
+
+    elif mode == 'manual':
+        if not content:
+            return "ERROR: 'content' is required for manual mode.", False
+        if save_skills(persona_name, content):
+            return f"Skills written for '{persona_name}' ({len(content)} chars).", True
+        return f"ERROR: Failed to save skills for '{persona_name}'.", False
+
+    elif mode == 'augment':
+        if not content:
+            return "ERROR: 'content' is required for augment mode.", False
+        existing = get_skills(persona_name)
+        if existing:
+            combined = existing + "\n\n" + content
+        else:
+            combined = content
+        if save_skills(persona_name, combined):
+            action = "augmented" if existing else "created"
+            return f"Skills {action} for '{persona_name}' ({len(combined)} chars total).", True
+        return f"ERROR: Failed to save skills for '{persona_name}'.", False
+
+    else:
+        return f"ERROR: Unknown mode '{mode}'. Use 'auto', 'manual', or 'augment'.", False

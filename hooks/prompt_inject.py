@@ -210,11 +210,35 @@ def _detect_capabilities(tool_names):
     return caps
 
 
-def _score_persona_for_task(tool_names, user_message):
+def _load_skills_triggers():
+    """Load trigger keywords from all personas' skills frontmatter.
+
+    Returns {persona_name: set(triggers)} for personas that have them.
+    Cached per-call (called once per prompt injection cycle).
+    """
+    try:
+        from persona_agents_skills import get_all_triggers
+        raw = get_all_triggers()
+        return {name: set(t.lower() for t in triggers) for name, triggers in raw.items()}
+    except Exception as e:
+        logger.debug(f"[TRIGGER-SCORING] Failed to load skills triggers: {e}")
+        return {}
+
+
+# Module-level cache — refreshed each prompt injection cycle
+_cached_triggers = {}
+
+
+def _score_persona_for_task(tool_names, user_message, persona_name=None):
     """Score how well a persona's tools match what the user's message actually needs.
 
     Returns (score, needed_tools_matched, total_needed).
     Score 0 = no match. Higher = better fit.
+
+    Scoring layers:
+    1. Tool overlap: +10 per needed tool the persona has
+    2. Capability breadth: +1 per task-capable tool
+    3. Trigger bonus: +15 per skills-declared trigger keyword found in message
 
     This is the Paperclip approach: analyze the task in CODE, don't leave it
     to the LLM to pattern-match against a roster list.
@@ -233,7 +257,14 @@ def _score_persona_for_task(tool_names, user_message):
 
     if not needed_tools:
         # No signal keywords found — fall back to raw capability count
-        return len(set(tool_names) & _TASK_FUNCTIONS), set(), set()
+        base = len(set(tool_names) & _TASK_FUNCTIONS)
+        # Still apply trigger bonus even without tool signals
+        trigger_bonus = 0
+        if persona_name and persona_name in _cached_triggers:
+            for trigger in _cached_triggers[persona_name]:
+                if trigger in msg_lower:
+                    trigger_bonus += 15
+        return base + trigger_bonus, set(), set()
 
     # Score = how many of the needed tools does this persona have?
     tool_set = set(tool_names)
@@ -241,6 +272,14 @@ def _score_persona_for_task(tool_names, user_message):
 
     # Weighted score: matched tools + small bonus for total capability breadth
     score = len(matched) * 10 + len(tool_set & _TASK_FUNCTIONS)
+
+    # ── Trigger bonus ─────────────────────────────────────────────────────────
+    # Skills-declared trigger keywords give +15 per hit, making skill expertise
+    # outweigh raw tool availability
+    if persona_name and persona_name in _cached_triggers:
+        for trigger in _cached_triggers[persona_name]:
+            if trigger in msg_lower:
+                score += 15
 
     return score, matched, needed_tools
 
@@ -337,6 +376,12 @@ def _inject_roster(event):
     if _team_filter is not None:
         logger.info(f"[TEAM-FILTER] Active team has {len(_team_filter)} members: {', '.join(sorted(_team_filter))}")
 
+    # ── Load skills triggers once for this injection cycle ───────────────────
+    global _cached_triggers
+    _cached_triggers = _load_skills_triggers()
+    if _cached_triggers:
+        logger.debug(f"[TRIGGER-SCORING] Loaded triggers for {len(_cached_triggers)} personas")
+
     # ── Score every persona against the user's message ──────────────────────
     specialists = []   # (score, name, line, matched_tools)
     chat_only = []
@@ -364,7 +409,7 @@ def _inject_roster(event):
 
         if _is_task_capable(tool_names):
             caps = _detect_capabilities(tool_names)
-            score, matched, needed = _score_persona_for_task(tool_names, user_message)
+            score, matched, needed = _score_persona_for_task(tool_names, user_message, persona_name=name)
             cap_str = f" — can: {', '.join(caps[:5])}" if caps else ""
             line = f"  - {name} [{toolset}, {tool_count} tools]{cap_str}"
             specialists.append((score, name, line, matched))

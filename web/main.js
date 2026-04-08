@@ -48,6 +48,7 @@ let _userAvatarUrl = '/static/users/user.webp';  // Fallback default
 let _teamsData = null;           // Full teams JSON from API
 let _activeTeam = 'all-hands';   // Currently selected team key
 let _activePersona = '';         // Currently active persona name (the "leader")
+let _toolsetFunctions = {};      // toolset_name → [function_names] from /api/toolsets
 
 // ─── Live Streaming State ──────────────────────────────────────────────────
 // Instead of fetching merged history, we track assistant turns live via SSE
@@ -71,7 +72,7 @@ function _injectNav() {
     const btn = document.createElement('button');
     btn.className = 'nav-item';
     btn.dataset.view = 'persona-agents';
-    btn.innerHTML = '<span class="nav-icon">\u{1F3AD}</span><span class="nav-label">Agents</span>';
+    btn.innerHTML = '<span class="nav-icon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="5" r="3"/><path d="M12 8v2"/><circle cx="5" cy="18" r="2.5"/><circle cx="19" cy="18" r="2.5"/><circle cx="12" cy="18" r="2.5"/><line x1="10" y1="11" x2="6.5" y2="15.5"/><line x1="14" y1="11" x2="17.5" y2="15.5"/><line x1="12" y1="10" x2="12" y2="15.5"/></svg></span><span class="nav-label">Agents</span>';
     if (spacer) rail.insertBefore(btn, spacer);
     else rail.appendChild(btn);
 }
@@ -263,13 +264,23 @@ function _bindEvents(el) {
 
 async function _loadPersonas() {
     try {
-        // Fetch personas and active persona in parallel
-        const [persResp, chatResp] = await Promise.all([
+        // Fetch personas, active persona, and toolset data in parallel
+        const [persResp, chatResp, tsResp] = await Promise.all([
             fetch(`${API}/personas`),
             fetch('/api/chats/active'),
+            fetch('/api/toolsets'),
         ]);
         const persData = await persResp.json();
         _allPersonas = persData.personas || [];
+
+        // Build toolset → functions map for capability filtering
+        try {
+            const tsData = await tsResp.json();
+            _toolsetFunctions = {};
+            for (const ts of (tsData.toolsets || [])) {
+                _toolsetFunctions[ts.name] = ts.functions || [];
+            }
+        } catch { _toolsetFunctions = {}; }
 
         // Get the active persona from chat settings
         const chatData = await chatResp.json();
@@ -474,6 +485,48 @@ function _renderRoster() {
     });
 }
 
+// Human-readable capability labels for common tools
+const _CAPABILITY_LABELS = {
+    'web_search':        'Web Search',
+    'get_website':       'Read Websites',
+    'research_topic':    'Deep Research',
+    'get_youtube_transcript': 'YouTube Transcripts',
+    'get_wikipedia':     'Wikipedia',
+    'run_command':       'Run Commands',
+    'execute_code':      'Execute Code',
+    'check_internet':    'Network Diagnostics',
+    'get_external_ip':   'External IP',
+    'website_status':    'Website Status',
+    'ha_activate':       'Smart Home',
+    'ha_set_light':      'Lights',
+    'ha_set_thermostat': 'Thermostat',
+    'get_images':        'Image Search',
+    'save_knowledge':    'Knowledge Base',
+    'tandem_browse':     'Tandem Browser',
+    'create_full_persona': 'Create Personas',
+    'ask_claude':        'Ask Claude',
+};
+
+function _getPersonaCapabilities(persona) {
+    const fns = _toolsetFunctions[persona.toolset] || [];
+    return new Set(fns);
+}
+
+function _getAllAvailableCapabilities(personas) {
+    // Collect all unique capabilities across the given personas
+    const caps = new Map(); // fn_name → label
+    for (const p of personas) {
+        const fns = _toolsetFunctions[p.toolset] || [];
+        for (const fn of fns) {
+            if (_CAPABILITY_LABELS[fn] && !caps.has(fn)) {
+                caps.set(fn, _CAPABILITY_LABELS[fn]);
+            }
+        }
+    }
+    // Sort by label
+    return [...caps.entries()].sort((a, b) => a[1].localeCompare(b[1]));
+}
+
 function _showAddMemberPicker() {
     // Remove existing picker
     document.getElementById('pa-add-member-picker')?.remove();
@@ -492,6 +545,9 @@ function _showAddMemberPicker() {
     const list = document.getElementById('pa-roster-list');
     if (!list) return;
 
+    // Get all capabilities available across these personas
+    const capabilities = _getAllAvailableCapabilities(available);
+
     const picker = document.createElement('div');
     picker.id = 'pa-add-member-picker';
     picker.className = 'pa-add-member-picker';
@@ -500,41 +556,84 @@ function _showAddMemberPicker() {
             <span>Add to ${_esc(teamObj.name)}</span>
             <button class="pa-add-member-close" title="Close">\u{2715}</button>
         </div>
-        <div class="pa-add-member-list">
-            ${available.map(p => {
-                const color = p.trim_color || '#4a9eff';
-                return `
-                    <div class="pa-add-member-item" data-persona="${_esc(p.name)}">
-                        <img class="pa-add-member-avatar" src="/api/personas/${p.name}/avatar"
-                             onerror="this.style.display='none'" style="border-color:${color}">
-                        <span class="pa-add-member-name" style="color:${color}">${_esc(p.display_name || p.name)}</span>
-                        <span class="pa-add-member-toolset">${_esc(p.toolset || 'none')}</span>
-                        <button class="pa-add-member-btn" data-persona="${_esc(p.name)}">Add</button>
-                    </div>`;
-            }).join('')}
+        ${capabilities.length > 0 ? `
+        <div class="pa-cap-filter">
+            <select id="pa-cap-filter-select">
+                <option value="">All Personas</option>
+                ${capabilities.map(([fn, label]) =>
+                    `<option value="${_esc(fn)}">\u{1F50D} ${_esc(label)}</option>`
+                ).join('')}
+            </select>
+        </div>` : ''}
+        <div class="pa-add-member-list" id="pa-add-member-list-inner">
         </div>`;
 
     list.appendChild(picker);
 
+    // Render the persona list (with optional filter)
+    function renderFiltered(capFilter) {
+        const filtered = capFilter
+            ? available.filter(p => _getPersonaCapabilities(p).has(capFilter))
+            : available;
+
+        const innerList = picker.querySelector('#pa-add-member-list-inner');
+        if (!innerList) return;
+
+        if (filtered.length === 0) {
+            innerList.innerHTML = '<div class="pa-add-member-empty">No personas have this capability</div>';
+            return;
+        }
+
+        innerList.innerHTML = filtered.map(p => {
+            const color = p.trim_color || '#4a9eff';
+            const fns = _toolsetFunctions[p.toolset] || [];
+            // Show top capabilities as small tags
+            const capTags = fns
+                .filter(fn => _CAPABILITY_LABELS[fn])
+                .slice(0, 4)
+                .map(fn => `<span class="pa-cap-tag">${_esc(_CAPABILITY_LABELS[fn])}</span>`)
+                .join('');
+            return `
+                <div class="pa-add-member-item" data-persona="${_esc(p.name)}">
+                    <img class="pa-add-member-avatar" src="/api/personas/${p.name}/avatar"
+                         onerror="this.style.display='none'" style="border-color:${color}">
+                    <div class="pa-add-member-info">
+                        <span class="pa-add-member-name" style="color:${color}">${_esc(p.display_name || p.name)}</span>
+                        <span class="pa-add-member-toolset">${_esc(p.toolset || 'none')} \u00B7 ${p.tool_count || 0} tools</span>
+                        <div class="pa-cap-tags">${capTags}</div>
+                    </div>
+                    <button class="pa-add-member-btn" data-persona="${_esc(p.name)}">Add</button>
+                </div>`;
+        }).join('');
+
+        // Bind add buttons
+        innerList.querySelectorAll('.pa-add-member-btn').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                const name = btn.dataset.persona;
+                teamObj.members[name] = true;
+                await fetch(`${API}/teams`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json', 'X-CSRF-Token': CSRF()},
+                    body: JSON.stringify(_teamsData),
+                });
+                _renderTeamDropdown();
+                _renderRoster();
+            });
+        });
+    }
+
+    // Initial render — show all
+    renderFiltered('');
+
+    // Bind filter dropdown
+    const filterSelect = picker.querySelector('#pa-cap-filter-select');
+    if (filterSelect) {
+        filterSelect.addEventListener('change', () => renderFiltered(filterSelect.value));
+    }
+
     // Bind close
     picker.querySelector('.pa-add-member-close')?.addEventListener('click', () => picker.remove());
-
-    // Bind add buttons
-    picker.querySelectorAll('.pa-add-member-btn').forEach(btn => {
-        btn.addEventListener('click', async (e) => {
-            e.stopPropagation();
-            const name = btn.dataset.persona;
-            // Add to team as enabled
-            teamObj.members[name] = true;
-            await fetch(`${API}/teams`, {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json', 'X-CSRF-Token': CSRF()},
-                body: JSON.stringify(_teamsData),
-            });
-            _renderTeamDropdown();
-            _renderRoster();
-        });
-    });
 }
 
 // ─── Transcript ─────────────────────────────────────────────────────────────
@@ -3230,24 +3329,42 @@ details[open].pa-think-block > .pa-think-summary::before { transform: rotate(90d
     font-size: 0.8rem; padding: 2px 4px;
 }
 .pa-add-member-close:hover { color: #ddd; }
-.pa-add-member-list { max-height: 200px; overflow-y: auto; padding: 4px; }
+.pa-add-member-list { max-height: 280px; overflow-y: auto; padding: 4px; }
 .pa-add-member-item {
     display: flex; align-items: center; gap: 8px;
     padding: 6px 8px; border-radius: 4px; transition: background 0.1s;
 }
 .pa-add-member-item:hover { background: #111120; }
 .pa-add-member-avatar {
-    width: 22px; height: 22px; border-radius: 50%;
+    width: 28px; height: 28px; border-radius: 50%;
     border: 2px solid #4a9eff; object-fit: cover; flex-shrink: 0;
 }
-.pa-add-member-name { flex: 1; color: #ddd; font-size: 0.78rem; }
-.pa-add-member-toolset { color: #555; font-size: 0.68rem; }
+.pa-add-member-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.pa-add-member-name { color: #ddd; font-size: 0.78rem; font-weight: 500; }
+.pa-add-member-toolset { color: #555; font-size: 0.65rem; }
+.pa-add-member-empty { color: #555; font-size: 0.75rem; text-align: center; padding: 16px 8px; }
 .pa-add-member-btn {
     background: none; border: 1px solid #333; color: #888;
     padding: 2px 10px; border-radius: 4px; cursor: pointer;
     font-size: 0.7rem; transition: all 0.15s; flex-shrink: 0;
 }
 .pa-add-member-btn:hover { color: #4a9eff; border-color: #4a9eff; }
+
+/* Capability filter dropdown */
+.pa-cap-filter { padding: 6px 10px; border-bottom: 1px solid #1a1a24; }
+.pa-cap-filter select {
+    width: 100%; background: #111120; color: #aaa; border: 1px solid #2a2a34;
+    border-radius: 4px; padding: 5px 8px; font-size: 0.72rem;
+    cursor: pointer; outline: none;
+}
+.pa-cap-filter select:focus { border-color: #4a9eff; }
+
+/* Capability tags on persona cards */
+.pa-cap-tags { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 2px; }
+.pa-cap-tag {
+    font-size: 0.58rem; color: #888; background: #1a1a24;
+    padding: 1px 5px; border-radius: 3px; white-space: nowrap;
+}
 
 /* ── Team Manager Modal ── */
 .pa-team-manager-body { padding: 16px; overflow-y: auto; max-height: 60vh; }
