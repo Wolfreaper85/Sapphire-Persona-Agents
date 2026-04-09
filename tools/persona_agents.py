@@ -84,8 +84,10 @@ try:
     from core.continuity.execution_context import ExecutionContext as _EC
     import config as _ec_config
     from typing import List, Dict
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
     _original_run = _EC.run  # Keep reference for non-delegate usage
+    _LLM_CALL_TIMEOUT = 120  # seconds — max time for a single LLM call before we bail
 
     def _patched_run(self, user_input: str, history_messages: List[Dict] = None) -> str:
         """Patched run() that preserves content on tool-call rounds for delegates.
@@ -126,9 +128,48 @@ try:
                 if total_tokens > context_limit * 0.9:
                     break
 
-            response_msg = self.tool_engine.call_llm_with_metrics(
-                self.provider, messages, self.gen_params, tools=self.tools
-            )
+            # Wrap LLM call in a timeout so a hung provider can't freeze the delegate forever.
+            # Poll in 2s increments so cancel events are checked while waiting.
+            # NOTE: We avoid the `with` context manager because shutdown(wait=True)
+            # would block until the thread finishes, defeating the timeout entirely.
+            _pool = ThreadPoolExecutor(max_workers=1)
+            _llm_bail = False
+            try:
+                _future = _pool.submit(
+                    self.tool_engine.call_llm_with_metrics,
+                    self.provider, messages, self.gen_params, tools=self.tools
+                )
+                _elapsed = 0
+                while _elapsed < _LLM_CALL_TIMEOUT:
+                    try:
+                        response_msg = _future.result(timeout=2)
+                        break  # Got a result
+                    except FuturesTimeout:
+                        _elapsed += 2
+                        # Check cancel while waiting for LLM
+                        if _force and _force.is_set():
+                            raise _DelegateCancelled()
+                        if _cancel and _cancel.is_set():
+                            # Soft cancel — break gracefully (matches behavior between iterations)
+                            _llm_bail = True
+                            break
+                else:
+                    # Exhausted timeout
+                    logger.warning(f"[PERSONA-AGENT] LLM call timed out after {_LLM_CALL_TIMEOUT}s on round {i+1}")
+                    _llm_bail = True
+            except _DelegateCancelled:
+                # Fire-and-forget cleanup — don't wait for the orphaned thread
+                _pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            except Exception as _llm_err:
+                logger.error(f"[PERSONA-AGENT] LLM call failed on round {i+1}: {_llm_err}")
+                _llm_bail = True
+            finally:
+                # Non-blocking cleanup — orphaned thread will finish on its own
+                _pool.shutdown(wait=False, cancel_futures=True)
+
+            if _llm_bail:
+                break
 
             if response_msg.has_tool_calls:
                 # KEY FIX: preserve full content instead of filter_to_thinking_only

@@ -49,6 +49,7 @@ let _teamsData = null;           // Full teams JSON from API
 let _activeTeam = 'all-hands';   // Currently selected team key
 let _activePersona = '';         // Currently active persona name (the "leader")
 let _toolsetFunctions = {};      // toolset_name → [function_names] from /api/toolsets
+let _viewMode = 'agents';        // 'agents' | 'chat' | 'compact'
 
 // ─── Live Streaming State ──────────────────────────────────────────────────
 // Instead of fetching merged history, we track assistant turns live via SSE
@@ -124,6 +125,7 @@ function _buildLayout() {
             </div>
             <span class="pa-subtitle">Delegation chain — your team at work</span>
             <div class="pa-header-actions">
+                <button class="pa-btn pa-btn-guide" id="pa-guide-btn" title="Quick-start guide">\u{2753} Guide</button>
                 <button class="pa-btn pa-toggle" id="pa-autocontinue-btn" title="Auto-Continue: when ON, lead persona automatically picks up delegate results and keeps going without waiting for you">
                     <span class="pa-toggle-dot" id="pa-autocontinue-dot"></span>
                     <span id="pa-autocontinue-label">Manual</span>
@@ -184,6 +186,11 @@ function _buildLayout() {
             </div>
 
             <div class="pa-transcript-panel">
+                <div class="pa-view-toggle" id="pa-view-toggle">
+                    <button class="pa-view-btn pa-view-active" data-view="agents" draggable="true" title="Delegation view — persona cards and team flow">Agents</button>
+                    <button class="pa-view-btn" data-view="chat" draggable="true" title="Full chat view — bubbles with thinking and tool details">Chat</button>
+                    <button class="pa-view-btn" data-view="compact" draggable="true" title="Compact view — clean bubbles, inline tools">Compact</button>
+                </div>
                 <div class="pa-transcript" id="pa-transcript">
                     <div class="pa-transcript-empty">\u{1F3AD} No delegations yet.<br>When your lead persona delegates tasks, each agent's work will appear here step by step.</div>
                 </div>
@@ -211,6 +218,7 @@ function _buildLayout() {
 // ─── Events ─────────────────────────────────────────────────────────────────
 
 function _bindEvents(el) {
+    el.querySelector('#pa-guide-btn').addEventListener('click', () => _showGuide());
     el.querySelector('#pa-clear-btn').addEventListener('click', () => _clearTranscript());
     el.querySelector('#pa-autocontinue-btn').addEventListener('click', () => _toggleAutoContinue());
     el.querySelector('#pa-log-btn').addEventListener('click', () => _toggleLog());
@@ -254,12 +262,118 @@ function _bindEvents(el) {
     // Chat input — sends to the active chat (talks to lead persona)
     el.querySelector('#pa-chat-send').addEventListener('click', () => _sendChat());
     el.querySelector('#pa-chat-stop').addEventListener('click', () => _stopChat());
+
+    // View mode toggle — click + drag-to-reorder
+    _initViewToggle(el);
+    // Restore saved view mode and update button state
+    _viewMode = localStorage.getItem('pa-view-mode') || 'agents';
+    el.querySelectorAll('.pa-view-btn').forEach(b => {
+        b.classList.toggle('pa-view-active', b.dataset.view === _viewMode);
+    });
     el.querySelector('#pa-chat-input').addEventListener('keydown', e => {
         if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); _sendChat(); }
     });
 
     // TTS bar button — play/stop last assistant message
     el.querySelector('#pa-bar-tts').addEventListener('click', () => _toggleBarTts());
+}
+
+// ─── View Mode Toggle ──────────────────────────────────────────────────────
+
+function _setViewMode(mode) {
+    _viewMode = mode;
+    localStorage.setItem('pa-view-mode', mode);
+
+    // Update active button styling
+    const toggle = document.getElementById('pa-view-toggle');
+    if (toggle) {
+        toggle.querySelectorAll('.pa-view-btn').forEach(btn => {
+            btn.classList.toggle('pa-view-active', btn.dataset.view === mode);
+        });
+    }
+
+    // Re-render transcript with the new mode
+    _fetchTranscript(true);
+}
+
+let _dragSrcBtn = null;  // The button being dragged
+
+function _initViewToggle(el) {
+    const toggle = el.querySelector('#pa-view-toggle');
+    if (!toggle) return;
+
+    // Restore saved button order
+    const savedOrder = localStorage.getItem('pa-view-order');
+    if (savedOrder) {
+        try {
+            const order = JSON.parse(savedOrder);
+            // Reorder buttons in the DOM to match saved order
+            for (const key of order) {
+                const btn = toggle.querySelector(`.pa-view-btn[data-view="${key}"]`);
+                if (btn) toggle.appendChild(btn);
+            }
+        } catch { /* ignore corrupt data */ }
+    }
+
+    // Click handler on each button
+    toggle.querySelectorAll('.pa-view-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            if (!btn.classList.contains('pa-view-dragging')) {
+                _setViewMode(btn.dataset.view);
+            }
+        });
+
+        // Drag start
+        btn.addEventListener('dragstart', e => {
+            _dragSrcBtn = btn;
+            btn.classList.add('pa-view-dragging');
+            e.dataTransfer.effectAllowed = 'move';
+            e.dataTransfer.setData('text/plain', btn.dataset.view);
+        });
+
+        // Drag over — allow drop + show insertion hint
+        btn.addEventListener('dragover', e => {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'move';
+            if (!_dragSrcBtn || _dragSrcBtn === btn) return;
+            const rect = btn.getBoundingClientRect();
+            const midX = rect.left + rect.width / 2;
+            btn.classList.toggle('pa-view-drop-before', e.clientX < midX);
+            btn.classList.toggle('pa-view-drop-after', e.clientX >= midX);
+        });
+
+        btn.addEventListener('dragleave', () => {
+            btn.classList.remove('pa-view-drop-before', 'pa-view-drop-after');
+        });
+
+        // Drop — reorder
+        btn.addEventListener('drop', e => {
+            e.preventDefault();
+            btn.classList.remove('pa-view-drop-before', 'pa-view-drop-after');
+            if (!_dragSrcBtn || _dragSrcBtn === btn) return;
+            const rect = btn.getBoundingClientRect();
+            const midX = rect.left + rect.width / 2;
+            if (e.clientX < midX) {
+                toggle.insertBefore(_dragSrcBtn, btn);
+            } else {
+                toggle.insertBefore(_dragSrcBtn, btn.nextSibling);
+            }
+            _saveViewOrder(toggle);
+        });
+
+        btn.addEventListener('dragend', () => {
+            btn.classList.remove('pa-view-dragging');
+            toggle.querySelectorAll('.pa-view-btn').forEach(b =>
+                b.classList.remove('pa-view-drop-before', 'pa-view-drop-after')
+            );
+            _dragSrcBtn = null;
+        });
+    });
+}
+
+function _saveViewOrder(toggle) {
+    const order = [...toggle.querySelectorAll('.pa-view-btn')].map(b => b.dataset.view);
+    localStorage.setItem('pa-view-order', JSON.stringify(order));
 }
 
 // ─── Data Loading ───────────────────────────────────────────────────────────
@@ -885,22 +999,30 @@ function _renderTranscript(chatMessages, delTranscript, activeDelegates) {
     timeline.sort((a, b) => (a.sort_time || '').localeCompare(b.sort_time || ''));
 
     let html = '';
-    for (const item of timeline) {
-        if (item.kind === 'chat') {
-            html += _renderChatMessage(item.data);
-        } else if (item.kind === 'segment') {
-            html += _renderSegment(item.data);
-        } else if (item.kind === 'dispatch') {
-            html += _renderDispatch(item.data);
-        } else if (item.kind === 'result') {
-            html += _renderResult(item.data);
-        }
-    }
 
-    // Show active delegates with spinner
-    for (const d of activeDelegates) {
-        if (d.status === 'running') {
-            html += _renderActive(d);
+    if (_viewMode === 'chat') {
+        html = _renderFullChatView(chatMessages, timeline, activeDelegates);
+    } else if (_viewMode === 'compact') {
+        html = _renderCompactChatView(chatMessages, timeline, activeDelegates);
+    } else {
+        // Default: Agents view (delegation cards)
+        for (const item of timeline) {
+            if (item.kind === 'chat') {
+                html += _renderChatMessage(item.data);
+            } else if (item.kind === 'segment') {
+                html += _renderSegment(item.data);
+            } else if (item.kind === 'dispatch') {
+                html += _renderDispatch(item.data);
+            } else if (item.kind === 'result') {
+                html += _renderResult(item.data);
+            }
+        }
+
+        // Show active delegates with spinner
+        for (const d of activeDelegates) {
+            if (d.status === 'running') {
+                html += _renderActive(d);
+            }
         }
     }
 
@@ -1204,6 +1326,233 @@ function _renderActive(d) {
     `;
 }
 
+// ─── Full Chat View (mode: "chat") ─────────────────────────────────────────
+// Shows ALL chat history as user/assistant bubbles with full detail:
+// thinking dropdowns, every tool call/result, model info. Like the main
+// Sapphire chat view — useful for troubleshooting what actually happened.
+
+function _renderFullChatView(chatMessages, timeline, activeDelegates) {
+    let html = '';
+
+    for (const msg of chatMessages) {
+        if (msg.role === 'system') continue;
+
+        const ts = msg.timestamp ? new Date(msg.timestamp).toLocaleTimeString() : '';
+
+        if (msg.role === 'user') {
+            const text = _getMsgText(msg);
+            if (!text) continue;
+            html += `<div class="pa-cv-msg pa-cv-user">
+                <div class="pa-cv-bubble pa-cv-bubble-user">
+                    <div class="pa-cv-header">
+                        <img class="pa-cv-avatar" src="${_userAvatarUrl}" onerror="this.src='/static/users/user.webp'">
+                        <span class="pa-cv-name">You</span>
+                        ${ts ? `<span class="pa-cv-time">${ts}</span>` : ''}
+                    </div>
+                    <div class="pa-cv-text">${_esc(text)}</div>
+                </div>
+            </div>`;
+            continue;
+        }
+
+        if (msg.role === 'assistant') {
+            const persona = msg.persona || _getLeadName();
+            const color = _getPersonaColor(persona);
+            const model = msg.metadata?.model || '';
+            const parts = msg.parts || [];
+
+            // Build content: thinking, text, tool calls, tool results — in order
+            let bodyHtml = '';
+            for (const part of parts) {
+                if (part.type === 'content' && part.text) {
+                    const ex = _extractThink(part.text);
+                    if (ex.thinking) {
+                        bodyHtml += `<details class="pa-think-block">
+                            <summary class="pa-think-summary">\u{1F4AD} Thinking</summary>
+                            <div class="pa-think-content">${_esc(ex.thinking).replace(/\n/g, '<br>')}</div>
+                        </details>`;
+                    }
+                    if (ex.visible) {
+                        bodyHtml += `<div class="pa-cv-text">${_esc(ex.visible).replace(/\n/g, '<br>')}</div>`;
+                    }
+                } else if (part.type === 'tool_call') {
+                    const args = part.arguments ? _truncate(JSON.stringify(part.arguments), 200) : '';
+                    bodyHtml += `<div class="pa-cv-tool-call">
+                        <span class="pa-cv-tool-icon">\u{1F527}</span>
+                        <span class="pa-cv-tool-name">${_esc(part.name || 'tool')}</span>
+                        ${args ? `<span class="pa-cv-tool-args">${_esc(args)}</span>` : ''}
+                    </div>`;
+                } else if (part.type === 'tool_result') {
+                    const resultText = typeof part.result === 'string' ? part.result : JSON.stringify(part.result || '');
+                    const isError = resultText.toLowerCase().includes('error');
+                    const icon = isError ? '\u{274C}' : '\u{2705}';
+                    bodyHtml += `<details class="pa-cv-tool-result ${isError ? 'pa-cv-tool-error' : ''}">
+                        <summary class="pa-cv-tool-result-summary">${icon} ${_esc(part.name || 'result')} — ${_esc(_truncate(resultText, 80))}</summary>
+                        <pre class="pa-cv-tool-result-body">${_esc(_truncate(resultText, 2000))}</pre>
+                    </details>`;
+                }
+            }
+
+            // Fallback if no parts
+            if (!bodyHtml && msg.content) {
+                const ex = _extractThink(typeof msg.content === 'string' ? msg.content : '');
+                if (ex.thinking) {
+                    bodyHtml += `<details class="pa-think-block">
+                        <summary class="pa-think-summary">\u{1F4AD} Thinking</summary>
+                        <div class="pa-think-content">${_esc(ex.thinking).replace(/\n/g, '<br>')}</div>
+                    </details>`;
+                }
+                if (ex.visible) {
+                    bodyHtml += `<div class="pa-cv-text">${_esc(ex.visible).replace(/\n/g, '<br>')}</div>`;
+                }
+            }
+
+            if (!bodyHtml) continue;
+
+            const modelTag = model ? `<span class="pa-cv-model">${_esc(model)}</span>` : '';
+
+            html += `<div class="pa-cv-msg pa-cv-assistant">
+                <div class="pa-cv-bubble pa-cv-bubble-assistant" style="border-left-color:${color}">
+                    <div class="pa-cv-header">
+                        <img class="pa-cv-avatar" src="/api/personas/${_esc(persona)}/avatar"
+                             onerror="this.style.display='none'" style="border-color:${color}">
+                        <span class="pa-cv-name" style="color:${color}">${_esc(persona)}</span>
+                        ${modelTag}
+                        ${ts ? `<span class="pa-cv-time">${ts}</span>` : ''}
+                    </div>
+                    ${bodyHtml}
+                </div>
+            </div>`;
+        }
+    }
+
+    // Active delegates — use chat-view styling to match surrounding bubbles
+    for (const d of activeDelegates) {
+        if (d.status === 'running') {
+            const color = d.trim_color || '#4a9eff';
+            const tools = (d.tool_log || []).join(', ') || 'working...';
+            html += `<div class="pa-cv-msg pa-cv-assistant">
+                <div class="pa-cv-bubble pa-cv-bubble-assistant" style="border-left-color:${color}">
+                    <div class="pa-cv-header">
+                        <img class="pa-cv-avatar" src="/api/personas/${_esc(d.persona)}/avatar"
+                             onerror="this.style.display='none'" style="border-color:${color}">
+                        <span class="pa-cv-name" style="color:${color}">${_esc(d.display_name || d.persona)}</span>
+                        <span class="pa-cv-model">\u{1F7E1} ${d.elapsed}s</span>
+                    </div>
+                    <div class="pa-cv-text" style="color:#888">${_esc(tools)}
+                        <span class="pa-typing-dots"><span>.</span><span>.</span><span>.</span></span>
+                    </div>
+                </div>
+            </div>`;
+        }
+    }
+
+    return html;
+}
+
+// ─── Compact Chat View (mode: "compact") ───────────────────────────────────
+// MC-style: clean bubbles, inline tool markers (🔧 tool... ✅), markdown
+// rendered, model label footer. No thinking. Streamlined for quick reading.
+
+function _renderCompactChatView(chatMessages, timeline, activeDelegates) {
+    let html = '';
+
+    for (const msg of chatMessages) {
+        if (msg.role === 'system') continue;
+
+        if (msg.role === 'user') {
+            const text = _getMsgText(msg);
+            if (!text) continue;
+            html += `<div class="pa-mc-bubble pa-mc-bubble-user">
+                <div class="pa-mc-content">${_esc(text)}</div>
+            </div>`;
+            continue;
+        }
+
+        if (msg.role === 'assistant') {
+            const parts = msg.parts || [];
+            let text = '';
+            const model = msg.metadata?.model || '';
+            const persona = msg.persona || '';
+            const color = _getPersonaColor(persona);
+
+            // Build text with inline tool markers (MC style)
+            if (parts.length) {
+                for (const part of parts) {
+                    if (part.type === 'content' && part.text) {
+                        text += _stripThink(part.text);
+                    } else if (part.type === 'tool_call') {
+                        text += `\n\u{1F527} ${part.name || 'tool'}...`;
+                    } else if (part.type === 'tool_result') {
+                        const resultStr = typeof part.result === 'string' ? part.result : JSON.stringify(part.result || '');
+                        const icon = resultStr.toLowerCase().includes('error') ? '\u{274C}' : '\u{2705}';
+                        text += ` ${icon}\n`;
+                    }
+                }
+            } else if (msg.content) {
+                text = _stripThink(typeof msg.content === 'string' ? msg.content : '');
+            }
+
+            text = text.trim();
+            if (!text) continue;
+
+            // Simple markdown: bold + code + linebreaks
+            let rendered = _esc(text);
+            rendered = rendered.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+            rendered = rendered.replace(/`([^`]+)`/g, '<code class="pa-mc-inline-code">$1</code>');
+            rendered = rendered.replace(/\n/g, '<br>');
+
+            // Footer with model + persona
+            const personaLabel = persona ? `<span class="pa-mc-persona" style="color:${color}">${_esc(persona)}</span>` : '';
+            const modelLabel = model ? `<span class="pa-mc-model">${_esc(model)}</span>` : '';
+            const footer = (personaLabel || modelLabel)
+                ? `<div class="pa-mc-footer">${personaLabel}${modelLabel}</div>`
+                : '';
+
+            html += `<div class="pa-mc-bubble pa-mc-bubble-assistant" style="border-left-color:${color}">
+                <div class="pa-mc-content">${rendered}</div>
+                ${footer}
+            </div>`;
+        }
+    }
+
+    // Active delegates — compact indicator
+    for (const d of activeDelegates) {
+        if (d.status === 'running') {
+            const color = d.trim_color || '#4a9eff';
+            html += `<div class="pa-mc-bubble pa-mc-bubble-active" style="border-left-color:${color}">
+                <div class="pa-mc-content">
+                    <span style="color:${color};font-weight:700">${_esc(d.display_name || d.persona)}</span>
+                    <span class="pa-mc-working">\u{1F7E1} working (${d.elapsed}s)...</span>
+                </div>
+            </div>`;
+        }
+    }
+
+    return html;
+}
+
+// ─── View helpers ──────────────────────────────────────────────────────────
+
+function _getMsgText(msg) {
+    if (msg.parts && Array.isArray(msg.parts)) {
+        return msg.parts
+            .filter(p => p.type === 'content' && p.text)
+            .map(p => _stripThink(p.text))
+            .filter(Boolean)
+            .join('\n');
+    }
+    if (msg.content) {
+        return _stripThink(typeof msg.content === 'string' ? msg.content : '');
+    }
+    return '';
+}
+
+function _truncate(str, max) {
+    if (!str) return '';
+    return str.length > max ? str.substring(0, max) + '...' : str;
+}
+
 // ─── TTS ────────────────────────────────────────────────────────────────────
 
 async function _playTts(btn) {
@@ -1246,6 +1595,95 @@ async function _playTts(btn) {
 }
 
 // ─── Log Panel ──────────────────────────────────────────────────────────────
+
+function _showGuide() {
+    // Remove existing guide if open
+    const existing = document.getElementById('pa-guide-overlay');
+    if (existing) { existing.remove(); return; }
+
+    const overlay = document.createElement('div');
+    overlay.id = 'pa-guide-overlay';
+    overlay.innerHTML = `
+        <div class="pa-guide-modal">
+            <div class="pa-guide-header">
+                <h2>\u{1F3AD} Persona Agents — Quick Start</h2>
+                <button class="pa-guide-close" id="pa-guide-close">\u{2715}</button>
+            </div>
+            <div class="pa-guide-body">
+                <div class="pa-guide-section">
+                    <h3>\u{1F465} Your Team</h3>
+                    <p>The <strong>Agent Roster</strong> on the left shows your available personas. Each has a specialty (research, coding, writing, etc.) and their own toolset.</p>
+                    <p>The persona with the <span style="color:#ffd700">LEAD</span> badge is your coordinator \u2014 they receive your messages and delegate tasks to the team.</p>
+                </div>
+
+                <div class="pa-guide-section">
+                    <h3>\u{1F4AC} How It Works</h3>
+                    <ol>
+                        <li><strong>You talk to the lead</strong> \u2014 type in the chat bar at the bottom</li>
+                        <li><strong>Lead delegates</strong> \u2014 they analyze your request and send tasks to specialists</li>
+                        <li><strong>Agents work</strong> \u2014 you'll see progress cards as each agent works</li>
+                        <li><strong>Lead summarizes</strong> \u2014 results come back through your lead persona</li>
+                    </ol>
+                </div>
+
+                <div class="pa-guide-section">
+                    <h3>\u{2699}\uFE0F Controls</h3>
+                    <div class="pa-guide-controls">
+                        <div class="pa-guide-control">
+                            <span class="pa-guide-badge">Lead \u25BC</span>
+                            <span>Change which persona leads the team</span>
+                        </div>
+                        <div class="pa-guide-control">
+                            <span class="pa-guide-badge">Toolset \u25BC</span>
+                            <span>Change what tools the lead can use</span>
+                        </div>
+                        <div class="pa-guide-control">
+                            <span class="pa-guide-badge">Manual / Auto</span>
+                            <span><strong>Manual</strong>: lead waits for you between steps. <strong>Auto</strong>: lead keeps going on their own</span>
+                        </div>
+                        <div class="pa-guide-control">
+                            <span class="pa-guide-badge">\u{1F7E2} Orb</span>
+                            <span>Spins while agents work. Pulses when ready for a nudge \u2014 click it to tell the lead to continue</span>
+                        </div>
+                        <div class="pa-guide-control">
+                            <span class="pa-guide-badge">Agents / Chat / Compact</span>
+                            <span>Switch how the conversation displays. Drag buttons to reorder</span>
+                        </div>
+                        <div class="pa-guide-control">
+                            <span class="pa-guide-badge">\u{23F9} Stop</span>
+                            <span>Appears during generation \u2014 stops the current response</span>
+                        </div>
+                        <div class="pa-guide-control">
+                            <span class="pa-guide-badge">\u{2715} Cancel</span>
+                            <span>On active delegate cards \u2014 cancel that specific agent without stopping everything</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="pa-guide-section">
+                    <h3>\u{1F9F0} Teams</h3>
+                    <p>Use the team dropdown to switch between different agent groups. Click the \u{2699} gear icon to create custom teams with specific members for different types of work.</p>
+                </div>
+
+                <div class="pa-guide-section">
+                    <h3>\u{1F4A1} Tips</h3>
+                    <ul>
+                        <li>Click any roster card to view and edit that persona's tools and skills</li>
+                        <li>The toggle switches on roster cards add/remove members from the active team</li>
+                        <li>Use <strong>Chat</strong> view mode to troubleshoot \u2014 it shows full thinking blocks and tool calls</li>
+                        <li>The <strong>Log</strong> button opens a raw delegation log for debugging</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(overlay);
+
+    // Close handlers
+    overlay.querySelector('#pa-guide-close').addEventListener('click', () => overlay.remove());
+    overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+}
 
 function _toggleLog() {
     const panel = document.getElementById('pa-log-panel');
@@ -2007,6 +2445,9 @@ function _updateOrbFromTranscript(delTranscript, activeDelegates, chatMessages) 
     } else if (_hasUnretrievedResults(delTranscript, chatMessages)) {
         // Fallback: results exist but lead didn't summarize (e.g. timeout)
         _setOrbState('nudge');
+    } else if (_lastResponseTruncated(chatMessages)) {
+        // Lead's response got cut off mid-sentence (local model early stop)
+        _setOrbState('nudge');
     } else {
         _setOrbState('idle');
     }
@@ -2032,19 +2473,64 @@ function _hasUnretrievedResults(delTranscript, chatMessages) {
     return hasDelegateCall && !hasText;
 }
 
+function _lastResponseTruncated(chatMessages) {
+    // Detect if the lead's last message was cut off mid-sentence
+    // (common with local models that emit early stop tokens)
+    const lastAssistant = [...chatMessages].reverse().find(m => m.role === 'assistant');
+    if (!lastAssistant) return false;
+
+    // Get the visible text (strip thinking)
+    let text = '';
+    if (lastAssistant.parts && Array.isArray(lastAssistant.parts)) {
+        text = lastAssistant.parts
+            .filter(p => p.type === 'content' && p.text)
+            .map(p => _stripThink(p.text))
+            .filter(Boolean)
+            .join('\n');
+    }
+    if (!text && lastAssistant.content) {
+        text = _stripThink(typeof lastAssistant.content === 'string' ? lastAssistant.content : '');
+    }
+
+    text = text.trim();
+    if (!text || text.length < 20) return false;  // Too short to judge
+
+    // If the text ends mid-word or without sentence-ending punctuation, it's likely cut off
+    const lastChar = text[text.length - 1];
+    const endsClean = '.!?"\u2019)\u201D\u2026*~'.includes(lastChar);
+    return !endsClean;
+}
+
 async function _orbNudge() {
     if (_orbState !== 'nudge') return;
     _aiTyping = true;
     _setOrbState('thinking');
     try {
         const { triggerSendWithText } = await import('/static/handlers/send-handlers.js');
-        await triggerSendWithText(
-            'All delegates have reported back. Please retrieve their results with get_delegate_result and give me a complete summary.'
-        );
+
+        // Pick the right nudge message based on why we're nudging
+        const lastAssistant = [...(await _getLastChatMessages())].reverse().find(m => m.role === 'assistant');
+        let nudgeText;
+        if (_lastResponseTruncated(lastAssistant ? [lastAssistant] : [])) {
+            nudgeText = 'Your last response was cut off. Please continue where you left off.';
+        } else {
+            nudgeText = 'All delegates have reported back. Please retrieve their results with get_delegate_result and give me a complete summary.';
+        }
+
+        await triggerSendWithText(nudgeText);
     } catch (e) {
         console.error('[PA] Orb nudge failed:', e);
         _setOrbState('nudge');
     }
+}
+
+async function _getLastChatMessages() {
+    try {
+        const resp = await fetch('/api/history', { headers: { 'X-CSRF-Token': CSRF() } });
+        if (!resp.ok) return [];
+        const data = await resp.json();
+        return data.messages || [];
+    } catch { return []; }
 }
 
 // ─── Bar TTS (Play/Stop last assistant message) ────────────────────────────
@@ -3641,6 +4127,178 @@ details[open].pa-think-block > .pa-think-summary::before { transform: rotate(90d
 .pa-editor-btn-secondary:hover { border-color: #4a9eff; color: #4a9eff; background: rgba(74,158,255,0.08); }
 .pa-editor-btn-primary { border-color: #4a9eff; color: #fff; background: #4a9eff; }
 .pa-editor-btn-primary:hover { background: #3a8aef; }
+
+/* ── Guide Modal ── */
+#pa-guide-overlay {
+    position: fixed; inset: 0; z-index: 9999;
+    background: rgba(0,0,0,0.75); backdrop-filter: blur(4px);
+    display: flex; align-items: center; justify-content: center;
+    animation: pa-fade-in 0.15s ease;
+}
+.pa-guide-modal {
+    width: 580px; max-width: 92vw; max-height: 82vh;
+    background: #0c0c16; border: 1px solid #222; border-radius: 12px;
+    display: flex; flex-direction: column; overflow: hidden;
+    box-shadow: 0 16px 64px rgba(0,0,0,0.6);
+}
+.pa-guide-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 20px; border-bottom: 1px solid #1a1a24;
+}
+.pa-guide-header h2 { margin: 0; font-size: 1rem; font-weight: 700; color: #ddd; }
+.pa-guide-close {
+    background: none; border: none; color: #555; font-size: 1.2rem;
+    cursor: pointer; padding: 4px 8px; border-radius: 4px; transition: color 0.15s;
+}
+.pa-guide-close:hover { color: #fff; }
+.pa-guide-body {
+    flex: 1; overflow-y: auto; padding: 16px 24px 24px;
+    display: flex; flex-direction: column; gap: 18px;
+}
+.pa-guide-section h3 {
+    margin: 0 0 8px; font-size: 0.88rem; font-weight: 700; color: #ccc;
+}
+.pa-guide-section p, .pa-guide-section li {
+    margin: 0 0 6px; font-size: 0.82rem; line-height: 1.55; color: #999;
+}
+.pa-guide-section ol, .pa-guide-section ul {
+    margin: 0; padding-left: 20px;
+}
+.pa-guide-section ol li { margin-bottom: 4px; }
+.pa-guide-section strong { color: #ccc; }
+.pa-guide-controls { display: flex; flex-direction: column; gap: 6px; }
+.pa-guide-control {
+    display: flex; align-items: center; gap: 10px;
+    font-size: 0.8rem; color: #999; line-height: 1.4;
+}
+.pa-guide-badge {
+    flex-shrink: 0; min-width: 110px;
+    background: #111118; border: 1px solid #2a2a34;
+    padding: 3px 10px; border-radius: 5px;
+    font-size: 0.72rem; font-weight: 600; color: #6ab0ff;
+    text-align: center;
+}
+.pa-btn-guide { color: #6ab0ff; border-color: rgba(106,176,255,0.25); }
+.pa-btn-guide:hover { color: #fff; border-color: #4a9eff; background: rgba(74,158,255,0.08); }
+
+/* ── View Toggle ── */
+.pa-view-toggle {
+    display: flex; gap: 0; padding: 6px 16px;
+    border-bottom: 1px solid #1a1a24; flex-shrink: 0;
+}
+.pa-view-btn {
+    background: none; border: none; color: #555; font-size: 0.75rem;
+    padding: 5px 14px; cursor: pointer; font-weight: 600;
+    border-bottom: 2px solid transparent;
+    transition: color 0.15s, border-color 0.15s;
+}
+.pa-view-btn:hover { color: #aaa; }
+.pa-view-btn[draggable="true"] { cursor: grab; }
+.pa-view-btn[draggable="true"]:active { cursor: grabbing; }
+.pa-view-active { color: #4a9eff; border-bottom-color: #4a9eff; }
+.pa-view-dragging { opacity: 0.35; }
+.pa-view-drop-before { box-shadow: -2px 0 0 0 #4a9eff; }
+.pa-view-drop-after { box-shadow: 2px 0 0 0 #4a9eff; }
+
+/* ── Chat View (full detail) ── */
+.pa-cv-msg { display: flex; animation: pa-fade-in 0.15s ease; margin-bottom: 4px; }
+.pa-cv-user { justify-content: flex-end; }
+.pa-cv-assistant { justify-content: flex-start; }
+.pa-cv-bubble { max-width: 90%; border-radius: 10px; padding: 10px 14px; }
+.pa-cv-bubble-user {
+    background: #1a1a2e; border: 1px solid #252540;
+    border-radius: 10px 10px 2px 10px;
+}
+.pa-cv-bubble-assistant {
+    background: #0c0c16; border-left: 3px solid #4a9eff;
+    border-radius: 2px 10px 10px 10px;
+}
+.pa-cv-header {
+    display: flex; align-items: center; gap: 8px;
+    margin-bottom: 6px; font-size: 0.82rem;
+}
+.pa-cv-avatar {
+    width: 28px; height: 28px; border-radius: 50%;
+    border: 2px solid #4a9eff; object-fit: cover; flex-shrink: 0;
+}
+.pa-cv-bubble-user .pa-cv-avatar { border-color: #555; }
+.pa-cv-name { font-weight: 700; color: #888; }
+.pa-cv-bubble-user .pa-cv-name { color: #666; }
+.pa-cv-time { font-size: 0.62rem; color: #444; margin-left: auto; }
+.pa-cv-model {
+    font-size: 0.6rem; color: #444; background: #111;
+    padding: 1px 6px; border-radius: 4px;
+}
+.pa-cv-text {
+    font-size: 0.84rem; line-height: 1.55; color: #ccc;
+    word-break: break-word; margin-bottom: 4px;
+}
+.pa-cv-bubble-user .pa-cv-text { color: #aaa; }
+
+/* Chat View — tool call/result blocks */
+.pa-cv-tool-call {
+    display: flex; align-items: center; gap: 6px;
+    padding: 4px 8px; margin: 3px 0; border-radius: 4px;
+    background: rgba(74,158,255,0.06); border: 1px solid rgba(74,158,255,0.12);
+    font-size: 0.75rem;
+}
+.pa-cv-tool-icon { font-size: 0.85rem; }
+.pa-cv-tool-name { font-weight: 600; color: #6ab0ff; }
+.pa-cv-tool-args {
+    color: #555; font-size: 0.68rem; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; max-width: 300px;
+}
+.pa-cv-tool-result {
+    margin: 2px 0; border-radius: 4px;
+    background: rgba(76,175,80,0.04); border: 1px solid rgba(76,175,80,0.12);
+}
+.pa-cv-tool-error { background: rgba(244,67,54,0.04); border-color: rgba(244,67,54,0.12); }
+.pa-cv-tool-result-summary {
+    cursor: pointer; padding: 4px 8px; font-size: 0.72rem;
+    color: #777; list-style: none; user-select: none;
+}
+.pa-cv-tool-result-summary::-webkit-details-marker { display: none; }
+.pa-cv-tool-result-body {
+    padding: 6px 10px; margin: 0; font-size: 0.68rem; color: #666;
+    max-height: 200px; overflow-y: auto; white-space: pre-wrap;
+    word-break: break-word; border-top: 1px solid rgba(255,255,255,0.05);
+    font-family: 'Consolas', 'Monaco', monospace;
+}
+
+/* ── Compact View (MC-style) ── */
+.pa-mc-bubble {
+    padding: 10px 16px; margin-bottom: 4px;
+    border-radius: 8px; animation: pa-fade-in 0.15s ease;
+}
+.pa-mc-bubble-user {
+    background: #1a1a2e; border: 1px solid #252540;
+    margin-left: 15%; border-radius: 10px 10px 2px 10px;
+}
+.pa-mc-bubble-assistant {
+    background: #0c0c16; border-left: 3px solid #4a9eff;
+    margin-right: 10%; border-radius: 2px 10px 10px 10px;
+}
+.pa-mc-bubble-active {
+    background: #0d0d16; border-left: 3px dashed #4a9eff;
+    margin-right: 10%; border-radius: 2px 10px 10px 10px;
+}
+.pa-mc-content {
+    font-size: 0.84rem; line-height: 1.6; color: #ccc;
+    word-break: break-word;
+}
+.pa-mc-bubble-user .pa-mc-content { color: #aaa; }
+.pa-mc-inline-code {
+    background: rgba(74,158,255,0.1); color: #7ac0ff;
+    padding: 1px 5px; border-radius: 3px; font-size: 0.8em;
+    font-family: 'Consolas', 'Monaco', monospace;
+}
+.pa-mc-footer {
+    display: flex; align-items: center; gap: 8px;
+    margin-top: 6px; padding-top: 4px; border-top: 1px solid rgba(255,255,255,0.04);
+}
+.pa-mc-persona { font-size: 0.68rem; font-weight: 600; text-transform: capitalize; }
+.pa-mc-model { font-size: 0.6rem; color: #444; }
+.pa-mc-working { font-size: 0.75rem; color: #888; margin-left: 6px; }
 
 /* Animations */
 @keyframes pa-fade-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
