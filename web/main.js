@@ -770,24 +770,43 @@ function _startListening() {
             _aiTyping = false;
             _endLiveTurn();
             _showStopButton(false);
-            // Only fetch transcript ONCE when streaming ends (not during)
+            // Fetch transcript once streaming ends. The live bubble stays visible
+            // until this fetch completes and _renderTranscript replaces innerHTML.
+            // Delayed re-fetch catches late DB commits without a visible blink
+            // because _renderTranscript only changes content if data differs.
             _fetchTranscript(true);
-            setTimeout(() => _fetchTranscript(true), 2000);
+            setTimeout(() => _fetchTranscript(true), 2500);
         }),
 
         // ── Live streaming — capture actual text chunks ──
         eventBus.on('chat_chunk', (data) => {
-            if (!_inLiveTurn || !data?.text) return;
+            if (!data?.text) return;
+            // Fallback: if event bus hasn't delivered ai_typing_start yet,
+            // start the live turn now. chat_chunk only fires during active
+            // streaming, so receiving one means we should be in a live turn.
+            if (!_inLiveTurn) {
+                _aiTyping = true;
+                _startLiveTurn();
+                _setOrbState('thinking');
+                _showStopButton(true);
+            }
             _onChatChunk(data.text);
         }),
 
         // ── Tool boundaries — segment splitting ──
         eventBus.on('tool_executing', (data) => {
-            if (!_inLiveTurn || !data?.name) return;
+            if (!data?.name) return;
+            // Same fallback — tool events only fire during active turns
+            if (!_inLiveTurn) {
+                _aiTyping = true;
+                _startLiveTurn();
+                _setOrbState('thinking');
+            }
             _onToolExecuting(data.name);
         }),
         eventBus.on('tool_complete', (data) => {
-            if (!_inLiveTurn || !data?.name) return;
+            if (!data?.name) return;
+            if (!_inLiveTurn) return;  // Don't force-start on complete alone
             _onToolComplete(data.name);
         }),
 
@@ -2184,6 +2203,13 @@ async function _regenFromButton(btn) {
         _completedTurns.clear();
         _liveSegments = [];
         _liveAccumulator = '';
+        _inLiveTurn = false;  // Reset so _startLiveTurn() can re-initialize
+
+        // Start live turn before streaming to avoid race condition
+        _aiTyping = true;
+        _startLiveTurn();
+        _setOrbState('thinking');
+        _showStopButton(true);
 
         // Re-stream the same message
         const { triggerSendWithText } = await import('/static/handlers/send-handlers.js');
@@ -2201,13 +2227,16 @@ async function _sendChat() {
 
     input.value = '';
     _aiTyping = true;
+    _startLiveTurn();       // Start live turn immediately — don't wait for event bus
     _setOrbState('thinking');
+    _showStopButton(true);
 
     try {
         const { triggerSendWithText } = await import('/static/handlers/send-handlers.js');
         await triggerSendWithText(text);
     } catch (e) {
         _aiTyping = false;
+        _endLiveTurn();
         console.error('[PA] Send failed:', e);
         // Restore text on failure
         input.value = text;
@@ -2243,18 +2272,69 @@ function _localISOTimestamp() {
     return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}000`;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// STREAMING ENGINE v2 — Incremental state machine
+//
+// Design: chunks flow through a simple state machine that tracks whether
+// we're inside a <think> block or visible text.  New text is appended as
+// DOM TextNode/BR elements — innerHTML is NEVER touched during streaming.
+// Full bubble rebuild only happens on phase transitions (dots→think→visible)
+// which occur 2-3 times per turn instead of hundreds.
+// ═══════════════════════════════════════════════════════════════════════════
+
+let _liveActiveTool = '';
+let _liveRAF = null;
+let _liveDirty = false;
+
+// Incremental text buffer — collects chunks between animation frames
+let _liveChunkBuf = '';
+
+// State machine: tracks whether incoming text is thinking or visible
+// so we never need to re-parse the full accumulator
+let _sm = {
+    inThink: false,          // currently inside <think> block?
+    thinkBuf: '',            // accumulated thinking text (for segment storage)
+    visBuf: '',              // accumulated visible text (for segment storage)
+    // DOM references — set once when bubble is created, never queried again
+    thinkEl: null,           // .pa-think-live-text element
+    visEl: null,             // .pa-live-text element
+    toolEl: null,            // .pa-tool-zone element
+    dotsEl: null,            // .pa-typing element (removed when text starts)
+    thinkWrap: null,         // .pa-think-live wrapper (hidden until thinking)
+    bubbleBuilt: false,      // has the bubble structure been created?
+};
+
+function _smReset() {
+    _sm = {
+        inThink: false, thinkBuf: '', visBuf: '',
+        thinkEl: null, visEl: null, toolEl: null, dotsEl: null,
+        thinkWrap: null, bubbleBuilt: false,
+    };
+    _liveChunkBuf = '';
+    _liveDirty = false;
+    if (_liveRAF) { cancelAnimationFrame(_liveRAF); _liveRAF = null; }
+}
+
 function _startLiveTurn() {
+    if (_inLiveTurn) return;  // Idempotent — don't reset if already started
     _inLiveTurn = true;
     _liveTurnId++;
     _liveSegments = [];
     _liveAccumulator = '';
+    _liveActiveTool = '';
     _liveSegmentStart = _localISOTimestamp();
     _livePreDelegation = true;
+    _smReset();
 }
 
 function _onChatChunk(text) {
     _liveAccumulator += text;
-    _updateLiveBubble();
+    _liveChunkBuf += text;
+    // Schedule a single DOM update per animation frame
+    if (!_liveDirty) {
+        _liveDirty = true;
+        _liveRAF = requestAnimationFrame(_flushLiveChunks);
+    }
 }
 
 function _onToolExecuting(toolName) {
@@ -2273,14 +2353,24 @@ function _onToolExecuting(toolName) {
         }
         _liveAccumulator = '';
         _livePreDelegation = false;
+        // Reset state machine for the post-delegation text
+        _sm.inThink = false;
+        _sm.thinkBuf = '';
+        _sm.visBuf = '';
     }
-    // For other tools, just note them (don't split segments)
+    _liveActiveTool = toolName;
+    // Update tool indicator without rebuilding
+    if (_sm.toolEl) {
+        _sm.toolEl.innerHTML = `<div class="pa-tool-activity"><span class="pa-tool-spinner"></span><span class="pa-tool-name">\u{1F527} ${_esc(toolName)}</span></div>`;
+    }
+    // Remove dots if still showing
+    if (_sm.dotsEl) { _sm.dotsEl.remove(); _sm.dotsEl = null; }
 }
 
 function _onToolComplete(toolName) {
+    _liveActiveTool = '';
+    if (_sm.toolEl) _sm.toolEl.innerHTML = '';
     if (toolName === 'delegate_task' || toolName === 'get_delegate_result') {
-        // After delegation tool completes, start a new text segment
-        // The next chat_chunk content will be the summary
         _liveAccumulator = '';
         _liveSegmentStart = _localISOTimestamp();
     }
@@ -2288,6 +2378,13 @@ function _onToolComplete(toolName) {
 
 function _endLiveTurn() {
     _inLiveTurn = false;
+    _liveActiveTool = '';
+    // Cancel any pending frame
+    if (_liveRAF) { cancelAnimationFrame(_liveRAF); _liveRAF = null; }
+    _liveDirty = false;
+
+    // Flush any remaining buffered chunks to the accumulator segments
+    // (don't need to render — we're about to remove the bubble)
 
     // Finalize any remaining accumulated text as the final segment
     if (_liveAccumulator.trim()) {
@@ -2304,8 +2401,13 @@ function _endLiveTurn() {
     }
     _liveAccumulator = '';
 
-    // Store completed turn with its segments
-    if (_liveSegments.length > 0) {
+    // Store completed turn — ONLY if it had delegation activity.
+    // Non-delegation turns are rendered from /api/history (the source of truth).
+    // Storing them here too causes double-rendering in the transcript.
+    const hasDelegation = _liveSegments.some(s =>
+        s.kind === 'dispatch' || s.kind === 'lead_text' || s.hasDelegation
+    );
+    if (hasDelegation && _liveSegments.length > 0) {
         const turnKey = `turn_${_liveTurnId}`;
         _completedTurns.set(turnKey, {
             segments: [..._liveSegments],
@@ -2314,95 +2416,174 @@ function _endLiveTurn() {
     }
     _liveSegments = [];
 
-    // Remove live bubble
-    const liveBubble = document.getElementById('pa-live-bubble');
-    if (liveBubble) liveBubble.remove();
+    // DON'T remove live bubble here — _fetchTranscript's _renderTranscript
+    // will replace the entire container.innerHTML, which removes it.
+    // Removing it early causes a flash/blink before the history renders.
+    // Just reset state machine so it stops processing chunks.
+    _smReset();
 }
 
-function _updateLiveBubble() {
+// ── Core render: called once per animation frame ──
+
+function _flushLiveChunks() {
+    _liveDirty = false;
+    const text = _liveChunkBuf;
+    _liveChunkBuf = '';
+    if (!text) return;
+
     const container = document.getElementById('pa-transcript');
     if (!container) return;
 
-    let bubble = document.getElementById('pa-live-bubble');
-    if (!bubble) {
-        bubble = document.createElement('div');
-        bubble.id = 'pa-live-bubble';
-        bubble.className = 'pa-chat-msg pa-chat-assistant';
-        container.appendChild(bubble);
+    // Build bubble structure on first chunk (one-time cost)
+    if (!_sm.bubbleBuilt) {
+        _buildLiveBubble(container);
     }
 
-    // Extract thinking + visible text for live display
-    const { thinking, visible } = _extractThink(_liveAccumulator);
+    // ── State machine: process new text incrementally ──
+    let pos = 0;
+    while (pos < text.length) {
+        if (_sm.inThink) {
+            // Look for </think> close tag
+            const closeIdx = text.indexOf('</think>', pos);
+            if (closeIdx === -1) {
+                // Still in thinking — append everything remaining
+                const chunk = text.slice(pos);
+                _sm.thinkBuf += chunk;
+                _appendTextToEl(_sm.thinkEl, chunk);
+                pos = text.length;
+            } else {
+                // Append text before the close tag
+                const chunk = text.slice(pos, closeIdx);
+                if (chunk) {
+                    _sm.thinkBuf += chunk;
+                    _appendTextToEl(_sm.thinkEl, chunk);
+                }
+                _sm.inThink = false;
+                pos = closeIdx + 8; // skip '</think>'
+            }
+        } else {
+            // Look for <think> open tag
+            const openIdx = text.indexOf('<think>', pos);
+            if (openIdx === -1) {
+                // No think tag — all visible text
+                const chunk = text.slice(pos);
+                // Strip any stray </think> or tag fragments
+                const clean = chunk.replace(/<\/?think>/gi, '').replace(/<\|channel>thought[^<]*/gi, '');
+                if (clean) {
+                    _sm.visBuf += clean;
+                    // Remove dots on first visible content
+                    if (_sm.dotsEl) { _sm.dotsEl.remove(); _sm.dotsEl = null; }
+                    _appendTextToEl(_sm.visEl, clean);
+                }
+                pos = text.length;
+            } else {
+                // Visible text before the <think> tag
+                const chunk = text.slice(pos, openIdx);
+                const clean = chunk.replace(/<\/?think>/gi, '').replace(/<\|channel>thought[^<]*/gi, '');
+                if (clean) {
+                    _sm.visBuf += clean;
+                    if (_sm.dotsEl) { _sm.dotsEl.remove(); _sm.dotsEl = null; }
+                    _appendTextToEl(_sm.visEl, clean);
+                }
+                _sm.inThink = true;
+                pos = openIdx + 7; // skip '<think>'
+                // Show thinking section
+                if (_sm.thinkWrap) _sm.thinkWrap.style.display = '';
+                if (_sm.dotsEl) { _sm.dotsEl.remove(); _sm.dotsEl = null; }
+            }
+        }
+    }
+
+    // Auto-scroll — only if user is near the bottom (not scrolled up reading)
+    // Uses direct assignment (no smooth CSS) to avoid animation jank at 60fps
+    if ((container.scrollHeight - container.scrollTop - container.clientHeight) < 150) {
+        container.scrollTop = container.scrollHeight;
+    }
+}
+
+// ── Append text to a DOM element using TextNodes (no innerHTML) ──
+
+function _appendTextToEl(el, text) {
+    if (!el || !text) return;
+    const parts = text.split('\n');
+    for (let i = 0; i < parts.length; i++) {
+        if (i > 0) el.appendChild(document.createElement('br'));
+        if (parts[i]) el.appendChild(document.createTextNode(parts[i]));
+    }
+}
+
+// ── Build the bubble DOM structure once ──
+
+function _buildLiveBubble(container) {
+    // Remove any stale bubble
+    const old = document.getElementById('pa-live-bubble');
+    if (old) old.remove();
+
     const leadColor = _getLeadColor();
     const leadName = _getLeadName();
     const leadDisplay = _getLeadDisplayName();
 
-    // Build HTML for any already-saved segments (pre-delegation text)
-    let priorSegmentsHtml = '';
+    const bubble = document.createElement('div');
+    bubble.id = 'pa-live-bubble';
+    bubble.className = 'pa-chat-msg pa-chat-assistant';
+
+    // Build prior segments if any (delegation text from before)
+    let priorHtml = '';
     for (const seg of _liveSegments) {
         if (seg.kind === 'lead_text' && seg.rawText) {
-            const { thinking: segThink, visible: segVis } = _extractThink(seg.rawText);
-            const segThinkHtml = segThink ? `
-                <details class="pa-think-block" open>
-                    <summary>\u{1F4AD} Thinking</summary>
-                    <div class="pa-think-text">${_esc(segThink).replace(/\n/g, '<br>')}</div>
-                </details>` : '';
-            const segVisHtml = segVis ? `<div class="pa-chat-text">${_esc(segVis).replace(/\n/g, '<br>')}</div>` : '';
-            priorSegmentsHtml += segThinkHtml + segVisHtml;
+            const { thinking: sT, visible: sV } = _extractThink(seg.rawText);
+            if (sT) priorHtml += `<details class="pa-think-block" open><summary>\u{1F4AD} Thinking</summary><div class="pa-think-text">${_esc(sT).replace(/\n/g, '<br>')}</div></details>`;
+            if (sV) priorHtml += `<div class="pa-chat-text">${_esc(sV).replace(/\n/g, '<br>')}</div>`;
         }
     }
 
-    const headerHtml = `
-        <div class="pa-chat-role">
-            <img class="pa-chat-avatar" src="/api/personas/${leadName}/avatar"
-                 onerror="this.style.display='none'" style="border-color:${leadColor}">
-            <span style="color:${leadColor}">${_esc(leadDisplay)}</span>
-            <span class="pa-chat-time">${new Date().toLocaleTimeString()}</span>
+    // Build the full structure with empty containers for live content
+    bubble.innerHTML = `
+        <div class="pa-chat-bubble pa-bubble-assistant" style="border-left-color:${leadColor}">
+            <div class="pa-chat-role">
+                <img class="pa-chat-avatar" src="/api/personas/${leadName}/avatar"
+                     onerror="this.style.display='none'" style="border-color:${leadColor}">
+                <span style="color:${leadColor}">${_esc(leadDisplay)}</span>
+                <span class="pa-chat-time">${new Date().toLocaleTimeString()}</span>
+            </div>
+            ${priorHtml}
+            <div class="pa-think-live" style="display:none">
+                <span class="pa-think-live-label">\u{1F4AD} Thinking</span>
+                <div class="pa-think-live-text"></div>
+            </div>
+            <div class="pa-chat-text pa-live-text"></div>
+            <div class="pa-tool-zone"></div>
+            <div class="pa-typing"><span class="pa-typing-dots"><span>.</span><span>.</span><span>.</span></span></div>
         </div>`;
 
-    // Show live thinking if we have it
-    const liveThinkHtml = thinking ? `
-        <div class="pa-think-live">
-            <span class="pa-think-live-label">\u{1F4AD} Thinking</span>
-            <div class="pa-think-live-text">${_esc(thinking).replace(/\n/g, '<br>')}</div>
-        </div>` : '';
+    container.appendChild(bubble);
 
-    if (!visible && !thinking && !priorSegmentsHtml) {
-        // Nothing yet — show typing dots
-        bubble.innerHTML = `
-            <div class="pa-chat-bubble pa-bubble-assistant" style="border-left-color:${leadColor}">
-                ${headerHtml}
-                <div class="pa-typing"><span class="pa-typing-dots"><span>.</span><span>.</span><span>.</span></span></div>
-            </div>`;
-    } else if (!visible && !thinking && priorSegmentsHtml) {
-        // Pre-delegation content saved, now waiting for delegate — show prior + dots
-        bubble.innerHTML = `
-            <div class="pa-chat-bubble pa-bubble-assistant" style="border-left-color:${leadColor}">
-                ${headerHtml}
-                ${priorSegmentsHtml}
-                <div class="pa-typing"><span class="pa-typing-dots"><span>.</span><span>.</span><span>.</span></span> Delegating...</div>
-            </div>`;
-    } else if (!visible && thinking) {
-        // Still in thinking — show live thoughts
-        bubble.innerHTML = `
-            <div class="pa-chat-bubble pa-bubble-assistant" style="border-left-color:${leadColor}">
-                ${headerHtml}
-                ${priorSegmentsHtml}
-                ${liveThinkHtml}
-                <div class="pa-typing"><span class="pa-typing-dots"><span>.</span><span>.</span><span>.</span></span></div>
-            </div>`;
-    } else {
-        // Have visible text (and maybe thinking)
-        bubble.innerHTML = `
-            <div class="pa-chat-bubble pa-bubble-assistant" style="border-left-color:${leadColor}">
-                ${headerHtml}
-                ${priorSegmentsHtml}
-                ${liveThinkHtml}
-                <div class="pa-chat-text">${_esc(visible).replace(/\n/g, '<br>')}</div>
-            </div>`;
+    // Cache DOM references — never query again during this turn
+    _sm.thinkEl = bubble.querySelector('.pa-think-live-text');
+    _sm.visEl = bubble.querySelector('.pa-live-text');
+    _sm.toolEl = bubble.querySelector('.pa-tool-zone');
+    _sm.dotsEl = bubble.querySelector('.pa-typing');
+    _sm.thinkWrap = bubble.querySelector('.pa-think-live');
+    _sm.bubbleBuilt = true;
+}
+
+// ── Legacy compat: _updateLiveBubble (called by transcript re-render) ──
+function _updateLiveBubble() {
+    // After the rewrite, this is only called on transcript re-render (rare).
+    // Just rebuild the bubble from current state.
+    const container = document.getElementById('pa-transcript');
+    if (!container || !_inLiveTurn) return;
+    _sm.bubbleBuilt = false;
+    _buildLiveBubble(container);
+    // Replay accumulated visible + thinking text into the new bubble
+    if (_sm.visBuf) _appendTextToEl(_sm.visEl, _sm.visBuf);
+    if (_sm.thinkBuf) {
+        if (_sm.thinkWrap) _sm.thinkWrap.style.display = '';
+        _appendTextToEl(_sm.thinkEl, _sm.thinkBuf);
     }
-
-    container.scrollTop = container.scrollHeight;
+    if (_sm.visBuf || _sm.thinkBuf) {
+        if (_sm.dotsEl) { _sm.dotsEl.remove(); _sm.dotsEl = null; }
+    }
 }
 
 function _getLeadName() {
@@ -3279,10 +3460,10 @@ function _closeEditor() {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+const _escDiv = document.createElement('div'); // Reuse single element
 function _esc(s) {
-    const d = document.createElement('div');
-    d.textContent = s;
-    return d.innerHTML;
+    _escDiv.textContent = s;
+    return _escDiv.innerHTML;
 }
 
 // ─── Styles ─────────────────────────────────────────────────────────────────
@@ -3572,6 +3753,10 @@ function _injectStyles() {
 .pa-transcript {
     flex: 1; overflow-y: auto; padding: 16px 24px;
     display: flex; flex-direction: column; gap: 12px;
+    /* scroll-behavior: smooth — REMOVED: causes animation jank with frequent scrollTop updates during streaming */
+}
+.pa-live-text {
+    transition: none; /* no flicker on innerHTML updates */
 }
 .pa-transcript-empty {
     color: #555; text-align: center; padding: 60px 20px; font-size: 0.9rem;
@@ -3721,6 +3906,19 @@ function _injectStyles() {
 .pa-typing-dots span:nth-child(1) { animation-delay: 0s; }
 .pa-typing-dots span:nth-child(2) { animation-delay: 0.2s; }
 .pa-typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+/* Tool activity indicator */
+.pa-tool-activity {
+    display: flex; align-items: center; gap: 6px;
+    padding: 4px 0; color: #888; font-size: 0.78rem;
+}
+.pa-tool-spinner {
+    width: 12px; height: 12px; border: 2px solid #333;
+    border-top-color: #4a9eff; border-radius: 50%;
+    animation: pa-spin 0.8s linear infinite;
+}
+.pa-tool-name { color: #4a9eff; font-family: 'Consolas', 'Monaco', monospace; }
+@keyframes pa-spin { to { transform: rotate(360deg); } }
 
 /* Log Panel */
 .pa-log-panel {

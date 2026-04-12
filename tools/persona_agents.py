@@ -67,6 +67,15 @@ except Exception as _e:
     def log_batch_complete(*a, **kw): pass
     def log_event(*a, **kw): pass
 
+# MemPalace IFTTT bridge — auto-detects and integrates if mempalace plugin is present
+try:
+    _mp_bridge = _load_sibling_module("mempalace_bridge.py", "persona_agents_mempalace_bridge")
+    _has_mempalace_bridge = True
+except Exception as _mpe:
+    logger.info(f"[PERSONA-AGENT] MemPalace bridge unavailable: {_mpe}")
+    _has_mempalace_bridge = False
+    _mp_bridge = None
+
 ENABLED = True
 EMOJI = '\U0001f3ad'
 
@@ -782,6 +791,22 @@ class PersonaDelegate:
         sub_depth = getattr(self, '_sub_depth', 0)
         max_rounds = 5 if sub_depth > 0 else 10
 
+        # Determine memory scope for delegates based on IFTTT bridge mode.
+        # When MemPalace is active: keep 'none' — memories injected directly via bridge.
+        # When 'standard' mode: unlock to 'default' so old tools actually work.
+        # When 'none' mode: keep 'none' — no memory at all.
+        _delegate_mem_scope = 'none'
+        _delegate_know_scope = 'none'
+        if _has_mempalace_bridge:
+            _mode = _mp_bridge.get_memory_mode()
+            if _mode == 'standard':
+                _delegate_mem_scope = 'default'
+                _delegate_know_scope = 'default'
+            # 'auto' with no mempalace → also unlock old tools
+            elif _mode == 'auto' and not _mp_bridge.should_use_mempalace():
+                _delegate_mem_scope = 'default'
+                _delegate_know_scope = 'default'
+
         task_settings = {
             'prompt': prompt_name,
             'toolset': self.toolset,
@@ -791,8 +816,8 @@ class PersonaDelegate:
             'max_parallel_tools': 3,
             'context_limit': context_budget,
             'inject_datetime': True,
-            'memory_scope': 'none',
-            'knowledge_scope': 'none',
+            'memory_scope': _delegate_mem_scope,
+            'knowledge_scope': _delegate_know_scope,
             'goal_scope': 'none',
             'email_scope': 'none',
             'bitcoin_scope': 'none',
@@ -806,18 +831,32 @@ class PersonaDelegate:
         ctx._cancel_event = self._cancel        # Graceful cancel
         ctx._force_cancel_event = self._force_cancel  # Force cancel
 
+        # ── IFTTT MemPalace integration ────────────────────────────────────
+        # If MemPalace is installed and enabled, inject memory layers into the
+        # delegate's system prompt and swap old memory tools for MemPalace tools.
+        # This happens AFTER ExecutionContext construction so we can modify
+        # ctx.system_prompt and ctx.tools directly.
+        if _has_mempalace_bridge and _mp_bridge.should_use_mempalace():
+            # Inject L0/L1/L2 memory layers into system prompt
+            mem_block = _mp_bridge.get_memory_injection(self.persona_name, self.task)
+            if mem_block:
+                ctx.system_prompt += mem_block
+
+            # Swap old memory/knowledge tools for MemPalace equivalents
+            _mp_bridge.swap_tools_in_ctx(ctx)
+
         # ── Build the delegation prompt ────────────────────────────────────
         # Tells the persona who they are, what tools they have, past lessons,
         # team context, and the actual task.
 
         # Resolve what tools this delegate actually has (for self-awareness)
+        # Read from ctx.tools (post-swap) so the delegate sees its actual tools
         tool_list_str = ""
         try:
-            from core.toolsets import toolset_manager
             if self.toolset == "all":
                 tool_list_str = "(full toolset — all tools available)"
-            elif toolset_manager.toolset_exists(self.toolset):
-                fn_names = toolset_manager.get_toolset_functions(self.toolset)
+            elif ctx.tools:
+                fn_names = [t['function']['name'] for t in ctx.tools if 'function' in t]
                 if fn_names:
                     tool_list_str = ", ".join(fn_names[:20])
                     if len(fn_names) > 20:
@@ -825,21 +864,58 @@ class PersonaDelegate:
         except Exception:
             pass
 
+        # Build workflow steps — adapts based on whether MemPalace is active
+        _mp_active = _has_mempalace_bridge and _mp_bridge.should_use_mempalace()
+
+        if _mp_active:
+            recall_step = (
+                f"2. RECALL MEMORIES: Check your [MemPalace — Your Memories] section in the system prompt. "
+                f"If you need deeper context, use memory_search or memory_recall.\n"
+            )
+            remember_step = (
+                f"   - Use memory_remember to save important findings or results for future tasks.\n"
+            )
+        else:
+            recall_step = ""
+            remember_step = ""
+
+        # Step numbering shifts when MemPalace adds a step
+        if _mp_active:
+            steps = (
+                f"YOUR WORKFLOW — follow these steps IN ORDER:\n"
+                f"1. ACKNOWLEDGE: Brief in-character greeting (1-2 sentences showing personality)\n"
+                f"{recall_step}"
+                f"3. CHECK LESSONS: Read your [Past Experience] section below (if any). Adapt your approach based on what you've learned before.\n"
+                f"4. DO THE WORK: Use your tools to complete the task.\n"
+                f"5. SHARE: If you found something other team members need, call shared_context_write.\n"
+                f"6. REFLECT: Before signing off, call record_lesson for EACH of these you encountered:\n"
+                f"   - Something that FAILED or was unexpected (category='temporary' if transient, 'session' if ongoing)\n"
+                f"   - A trick/workaround that WORKED (category='session' or 'permanent')\n"
+                f"   - A system/tool quirk worth remembering (category='permanent')\n"
+                f"{remember_step}"
+                f"   If the task was straightforward and nothing surprising happened, skip this step.\n"
+                f"7. REPORT: Give your results with a brief in-character sign-off.\n\n"
+            )
+        else:
+            steps = (
+                f"YOUR WORKFLOW — follow these steps IN ORDER:\n"
+                f"1. ACKNOWLEDGE: Brief in-character greeting (1-2 sentences showing personality)\n"
+                f"2. CHECK LESSONS: Read your [Past Experience] section below (if any). Adapt your approach based on what you've learned before.\n"
+                f"3. DO THE WORK: Use your tools to complete the task.\n"
+                f"4. SHARE: If you found something other team members need, call shared_context_write.\n"
+                f"5. REFLECT: Before signing off, call record_lesson for EACH of these you encountered:\n"
+                f"   - Something that FAILED or was unexpected (category='temporary' if transient, 'session' if ongoing)\n"
+                f"   - A trick/workaround that WORKED (category='session' or 'permanent')\n"
+                f"   - A system/tool quirk worth remembering (category='permanent')\n"
+                f"   If the task was straightforward and nothing surprising happened, skip this step.\n"
+                f"6. REPORT: Give your results with a brief in-character sign-off.\n\n"
+            )
+
         delegation_prompt = (
             f"[Team Delegation]\n"
             f"You've been called in to help with a task. You are {self.display_name}.\n"
             f"Stay fully in character throughout.\n\n"
-            f"YOUR WORKFLOW — follow these steps IN ORDER:\n"
-            f"1. ACKNOWLEDGE: Brief in-character greeting (1-2 sentences showing personality)\n"
-            f"2. CHECK LESSONS: Read your [Past Experience] section below (if any). Adapt your approach based on what you've learned before.\n"
-            f"3. DO THE WORK: Use your tools to complete the task.\n"
-            f"4. SHARE: If you found something other team members need, call shared_context_write.\n"
-            f"5. REFLECT: Before signing off, call record_lesson for EACH of these you encountered:\n"
-            f"   - Something that FAILED or was unexpected (category='temporary' if transient, 'session' if ongoing)\n"
-            f"   - A trick/workaround that WORKED (category='session' or 'permanent')\n"
-            f"   - A system/tool quirk worth remembering (category='permanent')\n"
-            f"   If the task was straightforward and nothing surprising happened, skip this step.\n"
-            f"6. REPORT: Give your results with a brief in-character sign-off.\n\n"
+            f"{steps}"
             f"⚠️ CRITICAL — NEVER FABRICATE:\n"
             f"- If you CANNOT access content (video, paywalled site, broken link), say so CLEARLY.\n"
             f"- NEVER invent timestamps, quotes, summaries, or data you didn't actually retrieve.\n"

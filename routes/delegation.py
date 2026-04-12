@@ -172,12 +172,37 @@ async def get_log_stats(**kwargs):
 
 # ── Plugin Settings (auto-continue toggle, etc.) ────────────────────────────
 
-_plugin_settings = {"auto_continue": False}
+_plugin_settings = {"auto_continue": False, "memory_mode": "auto"}
+
+# MemPalace bridge reference (lazy-loaded)
+_mp_bridge = None
+
+def _get_mp_bridge():
+    """Get MemPalace bridge module if available."""
+    global _mp_bridge
+    if _mp_bridge is not None:
+        return _mp_bridge
+    try:
+        import sys
+        if 'persona_agents_mempalace_bridge' in sys.modules:
+            _mp_bridge = sys.modules['persona_agents_mempalace_bridge']
+            return _mp_bridge
+    except Exception:
+        pass
+    return None
 
 
 async def get_settings(**kwargs):
     """Get persona-agents plugin settings."""
-    return dict(_plugin_settings)
+    result = dict(_plugin_settings)
+    # Include live MemPalace detection status so UI can show it
+    bridge = _get_mp_bridge()
+    if bridge:
+        result['mempalace_detected'] = bridge.should_use_mempalace()
+        result['memory_mode'] = bridge.get_memory_mode()
+    else:
+        result['mempalace_detected'] = False
+    return result
 
 
 async def save_settings(**kwargs):
@@ -185,6 +210,15 @@ async def save_settings(**kwargs):
     body = kwargs.get("body", {})
     if "auto_continue" in body:
         _plugin_settings["auto_continue"] = bool(body["auto_continue"])
+
+    # Memory mode setting (auto/mempalace/standard/none)
+    if "memory_mode" in body:
+        mode = str(body["memory_mode"]).lower().strip()
+        if mode in ('auto', 'mempalace', 'standard', 'none'):
+            _plugin_settings["memory_mode"] = mode
+            bridge = _get_mp_bridge()
+            if bridge:
+                bridge.set_memory_mode(mode)
 
     # Also update shared state so backend (prompt_inject hook) can read it
     shared = _get_shared()
