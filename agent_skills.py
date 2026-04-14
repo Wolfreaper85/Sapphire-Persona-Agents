@@ -132,6 +132,7 @@ You use MemPalace for persistent memory — semantic retrieval with automatic cr
 - Use `memory_remember` for anything worth keeping. If you discovered it and it matters, store it.
 - Use `memory_recall` before starting research to check if you already know something.
 - Use `memory_diary` for end-of-task reflections or observations that don't fit as factual memories.
+- **TTL (rolling memory)**: For time-sensitive data (stock prices, weather, news headlines), use `ttl='7d'` so old data auto-prunes. For permanent facts (preferences, portfolio tickers), omit ttl.
 """
 
 
@@ -502,7 +503,7 @@ def generate_skills(persona_name):
         'tandem_awareness': 'Get a quick digest/overview of the current page.',
         'tandem_focus_tab': 'Switch focus to a specific tab.',
         'tandem_context': 'Get a summary of the active tab (title, URL, state).',
-        'memory_remember': 'Store findings to MemPalace — persists across sessions.',
+        'memory_remember': 'Store findings to MemPalace — persists across sessions. Use ttl="7d" for time-sensitive data (prices, weather, news) so it auto-expires.',
         'memory_recall': 'Retrieve your past memories on a topic.',
         'memory_search': 'Search across all personas\' memories for related knowledge.',
         'memory_diary': 'Write a diary entry (personal reflections, session notes).',

@@ -215,6 +215,7 @@ try:
                             "[SYSTEM — Final tool round approaching]\n"
                             "You have ONE tool round left. Use it wisely:\n"
                             "- Call memory_remember to save your key findings before you run out of rounds.\n"
+                            "- For time-sensitive data (prices, weather, news), use ttl='7d' so it auto-expires.\n"
                             "- Then write your final report as visible text.\n"
                             "- Do NOT start new research — summarize what you have."
                         )
