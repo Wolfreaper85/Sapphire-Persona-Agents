@@ -137,5 +137,40 @@
       "record_lesson",
       "contradict_lesson"
     ]
+  },
+  "pa_secretary": {
+    "emoji": "\ud83d\udccb",
+    "description": "Administrative secretary — calendar, goals, habits, daily plans, notes, bulletins",
+    "functions": [
+      "mission_status",
+      "take_note",
+      "search_notes",
+      "list_notes",
+      "add_user_goal",
+      "complete_goal",
+      "create_event",
+      "update_event",
+      "delete_event",
+      "manage_daily_plan",
+      "create_habit",
+      "toggle_habit",
+      "focus_session",
+      "save_daily_note",
+      "post_bulletin",
+      "get_bulletins",
+      "edit_bulletin",
+      "get_learned_rules",
+      "edit_memory",
+      "save_memory",
+      "search_memory",
+      "get_time",
+      "notepad_read",
+      "notepad_append_lines",
+      "shared_context_write",
+      "shared_context_read",
+      "sub_delegate",
+      "record_lesson",
+      "contradict_lesson"
+    ]
   }
 }

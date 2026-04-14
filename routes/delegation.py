@@ -40,11 +40,15 @@ def _get_dlog():
 
 
 async def get_available_personas(**kwargs):
-    """Get all personas available for delegation with their toolset info."""
+    """Get all personas available for delegation with their toolset info.
+    Forces a re-read of personas.json so externally-added personas show up immediately.
+    """
     try:
         from core.personas.persona_manager import persona_manager
         from core.toolsets import toolset_manager
 
+        # Force re-read from disk so new personas appear without restart
+        persona_manager._load()
         personas = persona_manager.get_all()
         result = []
         for name, p in personas.items():

@@ -50,6 +50,7 @@ let _activeTeam = 'all-hands';   // Currently selected team key
 let _activePersona = '';         // Currently active persona name (the "leader")
 let _toolsetFunctions = {};      // toolset_name → [function_names] from /api/toolsets
 let _viewMode = 'agents';        // 'agents' | 'chat' | 'compact'
+let _personaHasAvatar = {};      // persona_name → bool — prevents 404 spam for missing avatars
 
 // ─── Live Streaming State ──────────────────────────────────────────────────
 // Instead of fetching merged history, we track assistant turns live via SSE
@@ -388,6 +389,7 @@ async function _loadPersonas() {
         ]);
         const persData = await persResp.json();
         _allPersonas = persData.personas || [];
+        _allPersonas.forEach(p => { _personaHasAvatar[p.name] = !!p.avatar; });
 
         // Build toolset → functions map for capability filtering
         try {
@@ -559,8 +561,7 @@ function _renderRoster() {
             </label>` : '';
         return `
             <div class="pa-roster-card${dimClass}${leaderClass}" data-persona="${_esc(p.name)}" style="border-left-color: ${color}">
-                <img class="pa-roster-avatar" src="/api/personas/${p.name}/avatar"
-                     onerror="this.style.display='none'" style="border-color: ${color}">
+                ${_avatarHTML(p.name, 'pa-roster-avatar', color)}
                 <div class="pa-roster-info">
                     <span class="pa-roster-name" style="color: ${color}">${_esc(p.display_name || p.name)}${leaderBadge}</span>
                     <span class="pa-roster-tagline">${_esc(p.tagline || '')}</span>
@@ -643,9 +644,19 @@ function _getAllAvailableCapabilities(personas) {
     return [...caps.entries()].sort((a, b) => a[1].localeCompare(b[1]));
 }
 
-function _showAddMemberPicker() {
-    // Remove existing picker
-    document.getElementById('pa-add-member-picker')?.remove();
+async function _showAddMemberPicker() {
+    // Remove existing modal
+    document.getElementById('pa-add-member-backdrop')?.remove();
+
+    // Re-fetch personas from API (forces backend to re-read from disk)
+    try {
+        const resp = await fetch(`${API}/personas`);
+        const data = await resp.json();
+        if (data.personas) {
+            _allPersonas = data.personas;
+            _allPersonas.forEach(p => { _personaHasAvatar[p.name] = !!p.avatar; });
+        }
+    } catch (e) { console.warn('[PA] Persona refresh failed:', e); }
 
     const teamObj = _teamsData?.teams?.[_activeTeam];
     if (!teamObj) return;
@@ -658,12 +669,15 @@ function _showAddMemberPicker() {
         return;
     }
 
-    const list = document.getElementById('pa-roster-list');
-    if (!list) return;
-
     // Get all capabilities available across these personas
     const capabilities = _getAllAvailableCapabilities(available);
 
+    // Create backdrop overlay
+    const backdrop = document.createElement('div');
+    backdrop.id = 'pa-add-member-backdrop';
+    backdrop.className = 'pa-add-member-backdrop';
+
+    // Create centered modal
     const picker = document.createElement('div');
     picker.id = 'pa-add-member-picker';
     picker.className = 'pa-add-member-picker';
@@ -672,10 +686,13 @@ function _showAddMemberPicker() {
             <span>Add to ${_esc(teamObj.name)}</span>
             <button class="pa-add-member-close" title="Close">\u{2715}</button>
         </div>
+        <div class="pa-add-member-search">
+            <input type="text" id="pa-member-search" placeholder="\u{1F50D} Search personas..." autocomplete="off" spellcheck="false">
+        </div>
         ${capabilities.length > 0 ? `
         <div class="pa-cap-filter">
             <select id="pa-cap-filter-select">
-                <option value="">All Personas</option>
+                <option value="">All Capabilities</option>
                 ${capabilities.map(([fn, label]) =>
                     `<option value="${_esc(fn)}">\u{1F50D} ${_esc(label)}</option>`
                 ).join('')}
@@ -684,19 +701,66 @@ function _showAddMemberPicker() {
         <div class="pa-add-member-list" id="pa-add-member-list-inner">
         </div>`;
 
-    list.appendChild(picker);
+    backdrop.appendChild(picker);
+    document.body.appendChild(backdrop);
 
-    // Render the persona list (with optional filter)
-    function renderFiltered(capFilter) {
-        const filtered = capFilter
-            ? available.filter(p => _getPersonaCapabilities(p).has(capFilter))
-            : available;
+    // Click backdrop (not modal) to close
+    backdrop.addEventListener('click', (e) => {
+        if (e.target === backdrop) backdrop.remove();
+    });
+    // Escape key to close
+    const _onEsc = (e) => { if (e.key === 'Escape') { backdrop.remove(); document.removeEventListener('keydown', _onEsc); } };
+    document.addEventListener('keydown', _onEsc);
+
+    // Focus the search input immediately
+    const searchInput = picker.querySelector('#pa-member-search');
+    if (searchInput) setTimeout(() => searchInput.focus(), 50);
+
+    // Fuzzy-ish search: match if all typed chars appear in order within the name
+    function _fuzzyMatch(query, text) {
+        if (!query) return true;
+        const q = query.toLowerCase();
+        const t = text.toLowerCase();
+        // First try simple substring match (covers most cases)
+        if (t.includes(q)) return true;
+        // Then try sequential character match (fuzzy)
+        let qi = 0;
+        for (let ti = 0; ti < t.length && qi < q.length; ti++) {
+            if (t[ti] === q[qi]) qi++;
+        }
+        return qi === q.length;
+    }
+
+    // Render the persona list filtered by both search text and capability
+    function renderFiltered() {
+        const searchQuery = (searchInput?.value || '').trim();
+        const capFilter = picker.querySelector('#pa-cap-filter-select')?.value || '';
+
+        let filtered = available;
+
+        // Apply search filter
+        if (searchQuery) {
+            filtered = filtered.filter(p => {
+                const name = p.display_name || p.name || '';
+                const tagline = p.tagline || '';
+                const toolset = p.toolset || '';
+                return _fuzzyMatch(searchQuery, name)
+                    || _fuzzyMatch(searchQuery, tagline)
+                    || _fuzzyMatch(searchQuery, toolset);
+            });
+        }
+
+        // Apply capability filter
+        if (capFilter) {
+            filtered = filtered.filter(p => _getPersonaCapabilities(p).has(capFilter));
+        }
 
         const innerList = picker.querySelector('#pa-add-member-list-inner');
         if (!innerList) return;
 
         if (filtered.length === 0) {
-            innerList.innerHTML = '<div class="pa-add-member-empty">No personas have this capability</div>';
+            const msg = searchQuery ? `No personas matching "${_esc(searchQuery)}"` : 'No personas have this capability';
+            innerList.innerHTML = `<div class="pa-add-member-empty">${msg}</div>`;
             return;
         }
 
@@ -711,10 +775,10 @@ function _showAddMemberPicker() {
                 .join('');
             return `
                 <div class="pa-add-member-item" data-persona="${_esc(p.name)}">
-                    <img class="pa-add-member-avatar" src="/api/personas/${p.name}/avatar"
-                         onerror="this.style.display='none'" style="border-color:${color}">
+                    ${_avatarHTML(p.name, 'pa-add-member-avatar', color)}
                     <div class="pa-add-member-info">
                         <span class="pa-add-member-name" style="color:${color}">${_esc(p.display_name || p.name)}</span>
+                        <span class="pa-add-member-tagline">${_esc(p.tagline || '')}</span>
                         <span class="pa-add-member-toolset">${_esc(p.toolset || 'none')} \u00B7 ${p.tool_count || 0} tools</span>
                         <div class="pa-cap-tags">${capTags}</div>
                     </div>
@@ -733,6 +797,8 @@ function _showAddMemberPicker() {
                     headers: {'Content-Type': 'application/json', 'X-CSRF-Token': CSRF()},
                     body: JSON.stringify(_teamsData),
                 });
+                backdrop.remove();
+                document.removeEventListener('keydown', _onEsc);
                 _renderTeamDropdown();
                 _renderRoster();
             });
@@ -740,16 +806,24 @@ function _showAddMemberPicker() {
     }
 
     // Initial render — show all
-    renderFiltered('');
+    renderFiltered();
 
-    // Bind filter dropdown
+    // Bind search — filter as you type
+    if (searchInput) {
+        searchInput.addEventListener('input', renderFiltered);
+    }
+
+    // Bind capability filter dropdown
     const filterSelect = picker.querySelector('#pa-cap-filter-select');
     if (filterSelect) {
-        filterSelect.addEventListener('change', () => renderFiltered(filterSelect.value));
+        filterSelect.addEventListener('change', renderFiltered);
     }
 
     // Bind close
-    picker.querySelector('.pa-add-member-close')?.addEventListener('click', () => picker.remove());
+    picker.querySelector('.pa-add-member-close')?.addEventListener('click', () => {
+        backdrop.remove();
+        document.removeEventListener('keydown', _onEsc);
+    });
 }
 
 // ─── Transcript ─────────────────────────────────────────────────────────────
@@ -1114,8 +1188,7 @@ function _renderSegment(seg) {
     return `<div class="pa-chat-msg pa-chat-assistant">
         <div class="pa-chat-bubble pa-bubble-assistant" style="border-left-color:${color}">
             <div class="pa-chat-role">
-                <img class="pa-chat-avatar" src="/api/personas/${_esc(leadName)}/avatar"
-                     onerror="this.style.display='none'" style="border-color:${color}">
+                ${_avatarHTML(leadName, 'pa-chat-avatar', color)}
                 <span style="color:${color}">${_esc(displayName)}</span>
                 ${labelTag}
                 ${ts ? `<span class="pa-chat-time">${ts}</span>` : ''}
@@ -1214,8 +1287,7 @@ function _renderChatMessage(msg) {
         return `<div class="pa-chat-msg pa-chat-assistant">
             <div class="pa-chat-bubble pa-bubble-assistant" style="border-left-color:${color}">
                 <div class="pa-chat-role">
-                    <img class="pa-chat-avatar" src="/api/personas/${_esc(persona)}/avatar"
-                         onerror="this.style.display='none'" style="border-color:${color}">
+                    ${_avatarHTML(persona, 'pa-chat-avatar', color)}
                     <span style="color:${color}">${_esc(personaName)}</span>
                     ${modelTag}${toolTag}
                     ${timeHtml}
@@ -1312,8 +1384,7 @@ function _renderResult(entry) {
     return `
         <div class="pa-message" style="border-left-color: ${color}">
             <div class="pa-msg-header">
-                <img class="pa-msg-avatar" src="/api/personas/${entry.persona}/avatar"
-                     onerror="this.style.display='none'" style="border-color:${color}">
+                ${_avatarHTML(entry.persona, 'pa-msg-avatar', color)}
                 <span class="pa-msg-name" style="color:${color}">${_esc(name)}</span>
                 <span class="pa-msg-meta">${statusIcon} ${entry.status} in ${entry.elapsed}s · tools: ${_esc(tools)}</span>
                 <button class="pa-tts-btn" title="Play TTS" ${voiceData} ${pitchData} ${speedData}
@@ -1331,8 +1402,7 @@ function _renderActive(d) {
     return `
         <div class="pa-message pa-message-active" style="border-left-color: ${color}">
             <div class="pa-msg-header">
-                <img class="pa-msg-avatar" src="/api/personas/${d.persona}/avatar"
-                     onerror="this.style.display='none'" style="border-color:${color}">
+                ${_avatarHTML(d.persona, 'pa-msg-avatar', color)}
                 <span class="pa-msg-name" style="color:${color}">${_esc(d.display_name || d.persona)}</span>
                 <span class="pa-msg-meta">\u{1F7E1} working (${d.elapsed}s) · ${_esc(tools)}</span>
                 <button class="pa-cancel-delegate-btn" data-delegate-id="${_esc(d.id)}"
@@ -1433,8 +1503,7 @@ function _renderFullChatView(chatMessages, timeline, activeDelegates) {
             html += `<div class="pa-cv-msg pa-cv-assistant">
                 <div class="pa-cv-bubble pa-cv-bubble-assistant" style="border-left-color:${color}">
                     <div class="pa-cv-header">
-                        <img class="pa-cv-avatar" src="/api/personas/${_esc(persona)}/avatar"
-                             onerror="this.style.display='none'" style="border-color:${color}">
+                        ${_avatarHTML(persona, 'pa-cv-avatar', color)}
                         <span class="pa-cv-name" style="color:${color}">${_esc(persona)}</span>
                         ${modelTag}
                         ${ts ? `<span class="pa-cv-time">${ts}</span>` : ''}
@@ -1453,8 +1522,7 @@ function _renderFullChatView(chatMessages, timeline, activeDelegates) {
             html += `<div class="pa-cv-msg pa-cv-assistant">
                 <div class="pa-cv-bubble pa-cv-bubble-assistant" style="border-left-color:${color}">
                     <div class="pa-cv-header">
-                        <img class="pa-cv-avatar" src="/api/personas/${_esc(d.persona)}/avatar"
-                             onerror="this.style.display='none'" style="border-color:${color}">
+                        ${_avatarHTML(d.persona, 'pa-cv-avatar', color)}
                         <span class="pa-cv-name" style="color:${color}">${_esc(d.display_name || d.persona)}</span>
                         <span class="pa-cv-model">\u{1F7E1} ${d.elapsed}s</span>
                     </div>
@@ -1897,8 +1965,7 @@ async function _populateLeadDropdown() {
             const color = p?.settings?.trim_color || '#4a9eff';
             const isActive = name === currentLabel || display === currentLabel;
             return `<div class="pa-ctx-dd-item ${isActive ? 'pa-ctx-dd-active' : ''}" data-name="${_esc(name)}">
-                <img class="pa-ctx-dd-avatar" src="/api/personas/${name}/avatar"
-                     onerror="this.style.display='none'" style="border-color:${color}">
+                ${_avatarHTML(name, 'pa-ctx-dd-avatar', color)}
                 <span style="color:${color}">${_esc(display)}</span>
             </div>`;
         }).join('');
@@ -2541,8 +2608,7 @@ function _buildLiveBubble(container) {
     bubble.innerHTML = `
         <div class="pa-chat-bubble pa-bubble-assistant" style="border-left-color:${leadColor}">
             <div class="pa-chat-role">
-                <img class="pa-chat-avatar" src="/api/personas/${leadName}/avatar"
-                     onerror="this.style.display='none'" style="border-color:${leadColor}">
+                ${_avatarHTML(leadName, 'pa-chat-avatar', leadColor)}
                 <span style="color:${leadColor}">${_esc(leadDisplay)}</span>
                 <span class="pa-chat-time">${new Date().toLocaleTimeString()}</span>
             </div>
@@ -2941,8 +3007,7 @@ function _openTeamEditor(teamKey) {
         return `
             <label class="pa-team-member-row">
                 <input type="checkbox" class="pa-team-member-cb" data-persona="${_esc(p.name)}" ${checked}>
-                <img class="pa-team-member-avatar" src="/api/personas/${p.name}/avatar"
-                     onerror="this.style.display='none'" style="border-color:${color}">
+                ${_avatarHTML(p.name, 'pa-team-member-avatar', color)}
                 <span class="pa-team-member-name" style="color:${color}">${_esc(p.display_name || p.name)}</span>
                 <span class="pa-team-member-toolset">${_esc(p.toolset || 'none')}</span>
             </label>`;
@@ -3150,8 +3215,7 @@ function _renderEditorModal() {
     overlay.innerHTML = `
         <div class="pa-editor-modal">
             <div class="pa-editor-header" style="border-bottom-color: ${color}">
-                <img class="pa-editor-avatar" src="/api/personas/${p.name}/avatar"
-                     onerror="this.style.display='none'" style="border-color: ${color}">
+                ${_avatarHTML(p.name, 'pa-editor-avatar', color)}
                 <div class="pa-editor-persona-info">
                     <span class="pa-editor-name" style="color: ${color}">${_esc(p.display_name || p.name)}</span>
                     <span class="pa-editor-tagline">${_esc(p.tagline || '')}</span>
@@ -3466,6 +3530,20 @@ function _esc(s) {
     return _escDiv.innerHTML;
 }
 
+/** Return avatar <img> if persona has one, otherwise a colored initials circle.
+ *  Prevents 404 spam for personas without avatar files. */
+function _avatarHTML(name, cssClass, color) {
+    if (_personaHasAvatar[name]) {
+        return `<img class="${cssClass}" src="/api/personas/${_esc(name)}/avatar"
+                     onerror="this.style.display='none'" style="border-color:${color}">`;
+    }
+    // Initials fallback — first letter of display name or persona key
+    const p = _allPersonas.find(x => x.name === name);
+    const display = p?.display_name || p?.name || name || '?';
+    const initial = display.charAt(0).toUpperCase();
+    return `<span class="${cssClass} pa-avatar-initial" style="border-color:${color}; background:${color}22; color:${color}">${initial}</span>`;
+}
+
 // ─── Styles ─────────────────────────────────────────────────────────────────
 
 function _injectStyles() {
@@ -3736,6 +3814,20 @@ function _injectStyles() {
     width: 32px; height: 32px; border-radius: 50%;
     border: 2px solid #4a9eff; object-fit: cover; flex-shrink: 0;
 }
+/* Initials fallback for personas without avatar files */
+.pa-avatar-initial {
+    display: inline-flex; align-items: center; justify-content: center;
+    border-radius: 50%; border: 2px solid #4a9eff; flex-shrink: 0;
+    font-weight: 700; text-transform: uppercase; box-sizing: border-box;
+}
+.pa-roster-avatar.pa-avatar-initial { width: 32px; height: 32px; font-size: 0.8rem; }
+.pa-add-member-avatar.pa-avatar-initial { width: 34px; height: 34px; font-size: 0.85rem; }
+.pa-chat-avatar.pa-avatar-initial { width: 30px; height: 30px; font-size: 0.75rem; }
+.pa-msg-avatar.pa-avatar-initial { width: 28px; height: 28px; font-size: 0.7rem; }
+.pa-cv-avatar.pa-avatar-initial { width: 24px; height: 24px; font-size: 0.6rem; }
+.pa-ctx-dd-avatar.pa-avatar-initial { width: 22px; height: 22px; font-size: 0.55rem; }
+.pa-editor-avatar.pa-avatar-initial { width: 48px; height: 48px; font-size: 1.2rem; }
+.pa-team-member-avatar.pa-avatar-initial { width: 24px; height: 24px; font-size: 0.6rem; }
 .pa-roster-info { display: flex; flex-direction: column; min-width: 0; flex: 1; }
 .pa-roster-name { font-weight: 700; font-size: 0.8rem; text-transform: capitalize; }
 .pa-roster-tagline {
@@ -4067,43 +4159,64 @@ details[open].pa-think-block > .pa-think-summary::before { transform: rotate(90d
     cursor: pointer; transition: all 0.15s;
 }
 .pa-roster-add-btn:hover { color: #4a9eff; border-color: #4a9eff; }
-.pa-add-member-picker {
-    background: #0e0e18; border: 1px solid #2a2a34; border-radius: 8px;
-    margin-top: 4px; overflow: hidden;
+.pa-add-member-backdrop {
+    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.55); z-index: 9998;
+    display: flex; align-items: center; justify-content: center;
+    animation: pa-fade-in 0.15s ease-out;
 }
+@keyframes pa-fade-in { from { opacity: 0; } to { opacity: 1; } }
+.pa-add-member-picker {
+    background: #0e0e18; border: 1px solid #2a2a34; border-radius: 12px;
+    width: 480px; max-width: 92vw; max-height: 75vh;
+    display: flex; flex-direction: column; overflow: hidden;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.6);
+    animation: pa-modal-pop 0.18s ease-out;
+    z-index: 9999;
+}
+@keyframes pa-modal-pop { from { opacity: 0; transform: scale(0.95); } to { opacity: 1; transform: scale(1); } }
 .pa-add-member-header {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 8px 10px; border-bottom: 1px solid #1a1a24;
-    font-size: 0.75rem; color: #888; font-weight: 600;
+    padding: 12px 16px; border-bottom: 1px solid #1a1a24;
+    font-size: 0.85rem; color: #ccc; font-weight: 600;
 }
 .pa-add-member-close {
     background: none; border: none; color: #666; cursor: pointer;
     font-size: 0.8rem; padding: 2px 4px;
 }
 .pa-add-member-close:hover { color: #ddd; }
-.pa-add-member-list { max-height: 280px; overflow-y: auto; padding: 4px; }
+.pa-add-member-search { padding: 10px 16px; border-bottom: 1px solid #1a1a24; }
+.pa-add-member-search input {
+    width: 100%; background: #111120; color: #ddd; border: 1px solid #2a2a34;
+    border-radius: 6px; padding: 8px 12px; font-size: 0.8rem;
+    outline: none; box-sizing: border-box; transition: border-color 0.15s;
+}
+.pa-add-member-search input:focus { border-color: #4a9eff; }
+.pa-add-member-search input::placeholder { color: #555; }
+.pa-add-member-list { flex: 1; overflow-y: auto; padding: 6px 8px; min-height: 0; }
 .pa-add-member-item {
-    display: flex; align-items: center; gap: 8px;
-    padding: 6px 8px; border-radius: 4px; transition: background 0.1s;
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 10px; border-radius: 6px; transition: background 0.1s;
 }
 .pa-add-member-item:hover { background: #111120; }
 .pa-add-member-avatar {
-    width: 28px; height: 28px; border-radius: 50%;
+    width: 34px; height: 34px; border-radius: 50%;
     border: 2px solid #4a9eff; object-fit: cover; flex-shrink: 0;
 }
 .pa-add-member-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
-.pa-add-member-name { color: #ddd; font-size: 0.78rem; font-weight: 500; }
+.pa-add-member-name { color: #ddd; font-size: 0.82rem; font-weight: 500; }
+.pa-add-member-tagline { color: #666; font-size: 0.62rem; font-style: italic; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .pa-add-member-toolset { color: #555; font-size: 0.65rem; }
 .pa-add-member-empty { color: #555; font-size: 0.75rem; text-align: center; padding: 16px 8px; }
 .pa-add-member-btn {
     background: none; border: 1px solid #333; color: #888;
-    padding: 2px 10px; border-radius: 4px; cursor: pointer;
-    font-size: 0.7rem; transition: all 0.15s; flex-shrink: 0;
+    padding: 4px 14px; border-radius: 4px; cursor: pointer;
+    font-size: 0.72rem; transition: all 0.15s; flex-shrink: 0;
 }
-.pa-add-member-btn:hover { color: #4a9eff; border-color: #4a9eff; }
+.pa-add-member-btn:hover { color: #4a9eff; border-color: #4a9eff; background: rgba(74,158,255,0.06); }
 
 /* Capability filter dropdown */
-.pa-cap-filter { padding: 6px 10px; border-bottom: 1px solid #1a1a24; }
+.pa-cap-filter { padding: 8px 16px; border-bottom: 1px solid #1a1a24; }
 .pa-cap-filter select {
     width: 100%; background: #111120; color: #aaa; border: 1px solid #2a2a34;
     border-radius: 4px; padding: 5px 8px; font-size: 0.72rem;

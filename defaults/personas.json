@@ -63,5 +63,21 @@
       "goal_scope": "default",
       "knowledge_scope": "default"
     }
+  },
+  "donna": {
+    "name": "donna",
+    "tagline": "I don't get lucky. I make my own luck.",
+    "settings": {
+      "prompt": "pa_donna",
+      "toolset": "pa_secretary",
+      "voice": "bf_emma",
+      "pitch": 0.98,
+      "speed": 1.0,
+      "trim_color": "#c2185b",
+      "inject_datetime": true,
+      "memory_scope": "donna",
+      "goal_scope": "default",
+      "knowledge_scope": "default"
+    }
   }
 }
