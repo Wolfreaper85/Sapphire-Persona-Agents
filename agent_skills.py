@@ -30,6 +30,7 @@ _ROLE_TRIGGERS = {
     'Persona Architect': ['create persona', 'design persona', 'new character', 'new agent'],
     'Versatile Specialist': ['research', 'build', 'code', 'investigate', 'fix', 'deploy'],
     'Financial Analyst': ['stock', 'dividend', 'portfolio', 'earnings', 'market', 'invest', 'finance', 'yield', 'etf'],
+    'Secretary': ['calendar', 'schedule', 'meeting', 'reminder', 'alarm', 'event', 'appointment', 'deadline', 'plan', 'habit', 'goal', 'note', 'journal', 'organize', 'laundry', 'todo', 'errand'],
 }
 
 # ── Approach patterns by role ─────────────────────────────────────────────────
@@ -64,6 +65,13 @@ _ROLE_APPROACHES = {
         ('Stock research', 'Search for current data first, then deep-dive into fundamentals. Cross-reference multiple financial sources.'),
         ('Portfolio analysis', 'Gather current prices and yields, calculate metrics, present a clear summary with sources.'),
         ('Market news', 'Check multiple financial news sources, distinguish analysis from reporting, note the publication date.'),
+    ],
+    'Secretary': [
+        ('Calendar events', 'ONE create_event call per request. Set start_time to when the event happens, use reminder_minutes for advance alerts (e.g. reminder_minutes=60 for 1-hour warning). NEVER create separate alarm events — use reminder_minutes instead.'),
+        ('Reminders & alarms', 'An "alarm" or "alert" before an event = reminder_minutes on that event, NOT a second event. 1 hour before = reminder_minutes=60. 30 min before = reminder_minutes=30.'),
+        ('Goals & habits', 'Use add_user_goal for long-term objectives, create_habit for recurring daily/weekly tasks. Use toggle_habit to mark habits done.'),
+        ('Daily planning', 'Use manage_daily_plan to set up today\'s focus goals. Use save_daily_note for journal entries.'),
+        ('Notes & bulletins', 'Use take_note for quick reference notes. Use post_bulletin for team-visible announcements or pattern proposals.'),
     ],
     'Versatile Specialist': [
         ('Mixed tasks', 'Identify which parts need research vs. implementation. Handle research first to inform the build.'),
@@ -118,8 +126,21 @@ You use MemPalace for persistent memory — semantic retrieval with automatic cr
 - **memory_remember**: Store important findings, insights, or facts. They persist across sessions.
 - **memory_recall**: Retrieve YOUR past memories on a topic (searches your personal wing).
 - **memory_search**: Search across ALL personas' memories — use when you need cross-team context.
+- **memory_diary**: Write a personal diary entry — reflections, session notes, things you noticed. One per day.
+- **vault_write**: Write a note directly to the Obsidian vault — use for structured documentation, guides, or reference material.
+- **vault_read**: Read a note from the Obsidian vault — check existing docs before writing new ones.
 - Use `memory_remember` for anything worth keeping. If you discovered it and it matters, store it.
 - Use `memory_recall` before starting research to check if you already know something.
+- Use `memory_diary` for end-of-task reflections or observations that don't fit as factual memories.
+"""
+
+
+_SECRETARY_GUIDANCE = """## Calendar Rules (CRITICAL)
+- **ONE event per request.** Never create multiple events for the same thing.
+- **Alarms/reminders = reminder_minutes**, NOT separate events. "Alarm 1 hour before" = `reminder_minutes=60` on the MAIN event, not a second event at an earlier time.
+- **start_time = when the thing happens.** If user says "laundry at 10am with alarm 1 hour before", the event is at 10:00 with `reminder_minutes=60`. NOT an event at 9:00.
+- Use `category="reminder"` for reminder-type events, `category="event"` for scheduled activities.
+- Always use `get_time` first to confirm today's date before creating events.
 """
 
 
@@ -354,12 +375,19 @@ def generate_skills(persona_name):
     has_browser = 'tandem_browse' in tool_names
     has_mempalace = 'memory_remember' in tool_names
     has_persona_create = 'create_full_persona' in tool_names
+    has_calendar = 'create_event' in tool_names
+    has_goals = 'add_user_goal' in tool_names or 'create_goal' in tool_names
+    has_habits = 'create_habit' in tool_names
     # Detect financial toolset by checking the toolset name directly
     # (save_knowledge is in most toolsets, so tool-presence alone is unreliable)
     is_finance_toolset = toolset in ('pa_financial', 'financial', 'finance')
+    is_secretary_toolset = toolset in ('pa_secretary', 'secretary') or (has_calendar and has_habits)
 
     # Determine primary role
-    if has_smarthome:
+    if is_secretary_toolset:
+        role = "Secretary"
+        role_desc = "You manage the user's calendar, goals, habits, daily plans, and notes. You are organized, efficient, and precise."
+    elif has_smarthome:
         role = "Smart Home Controller"
         role_desc = "You control smart home devices — lights, thermostat, switches, and automations."
     elif is_finance_toolset:
@@ -401,6 +429,8 @@ def generate_skills(persona_name):
         'tandem_extract', 'create_full_persona', 'get_images',
         'get_youtube_transcript', 'save_knowledge', 'memory_remember',
         'memory_recall', 'memory_search',
+        'create_event', 'update_event', 'delete_event', 'manage_daily_plan',
+        'add_user_goal', 'create_habit', 'take_note', 'post_bulletin',
     })
 
     frontmatter_lines = [
@@ -481,6 +511,26 @@ def generate_skills(persona_name):
         'create_full_persona': 'Create a complete new persona.',
         'research_character': 'Research a character for persona creation.',
         'save_knowledge': 'Save important findings to long-term memory.',
+        # ── Mission Control tools ──
+        'create_event': 'Create a calendar event. Set start_time to the EVENT time, use reminder_minutes for advance alerts. NEVER make a separate event for an alarm — use reminder_minutes instead.',
+        'update_event': 'Modify an existing calendar event by ID.',
+        'delete_event': 'Remove a calendar event by ID.',
+        'manage_daily_plan': 'Create or complete today\'s daily plan with selected goals.',
+        'save_daily_note': 'Save a journal entry for today (one per day).',
+        'add_user_goal': 'Create a long-term user goal.',
+        'complete_goal': 'Mark a goal as done.',
+        'create_habit': 'Create a recurring habit to track (daily/weekly).',
+        'toggle_habit': 'Mark a habit as done/undone for today.',
+        'focus_session': 'Start a timed focus session.',
+        'take_note': 'Save a quick reference note to the MC notes board.',
+        'search_notes': 'Search through saved notes.',
+        'list_notes': 'List all notes on the board.',
+        'post_bulletin': 'Post to the team bulletin board.',
+        'get_bulletins': 'Read current bulletins.',
+        'edit_bulletin': 'Update or resolve a bulletin.',
+        'mission_status': 'Get full MC dashboard — goals, habits, events, daily plan overview.',
+        'get_learned_rules': 'Read active learned behavior rules.',
+        'edit_memory': 'Edit a specific memory entry.',
     }
 
     for tool_name in sorted(tool_names):
@@ -502,6 +552,7 @@ def generate_skills(persona_name):
     # ── Build optional capability sections ────────────────────────────────────
     tandem_section = _TANDEM_WORKFLOW if has_browser else ""
     mempalace_section = _MEMPALACE_GUIDANCE if has_mempalace else ""
+    secretary_section = _SECRETARY_GUIDANCE if is_secretary_toolset else ""
 
     # ── Build tips ────────────────────────────────────────────────────────────
     tips = []
@@ -524,7 +575,7 @@ def generate_skills(persona_name):
 {approach_section}## Your Role
 {role_desc}
 
-{tandem_section}{mempalace_section}## When to Use Your Tools
+{tandem_section}{mempalace_section}{secretary_section}## When to Use Your Tools
 {tools_section}
 
 ## What You Should NOT Do
