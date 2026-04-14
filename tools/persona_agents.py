@@ -203,6 +203,23 @@ try:
                 )
                 if tool_images:
                     _inject_tool_images(messages, tool_images)
+
+                # ── Last-round nudge: save findings before cutoff ─────────
+                # On the second-to-last round, inject a reminder so the agent
+                # uses its final round to store results via memory_remember
+                # instead of burning it on yet another browse/search.
+                if i == max_iterations - 2:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "[SYSTEM — Final tool round approaching]\n"
+                            "You have ONE tool round left. Use it wisely:\n"
+                            "- Call memory_remember to save your key findings before you run out of rounds.\n"
+                            "- Then write your final report as visible text.\n"
+                            "- Do NOT start new research — summarize what you have."
+                        )
+                    })
+
                 continue
 
             elif response_msg.content:
@@ -216,6 +233,20 @@ try:
                     )
                     if tool_images:
                         _inject_tool_images(messages, tool_images)
+
+                    # Last-round nudge for text-based tool calls too
+                    if i == max_iterations - 2:
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "[SYSTEM — Final tool round approaching]\n"
+                                "You have ONE tool round left. Use it wisely:\n"
+                                "- Call memory_remember to save your key findings before you run out of rounds.\n"
+                                "- Then write your final report as visible text.\n"
+                                "- Do NOT start new research — summarize what you have."
+                            )
+                        })
+
                     continue
 
                 final_content = response_msg.content
