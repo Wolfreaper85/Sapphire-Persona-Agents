@@ -27,6 +27,13 @@ _DELEGATION_TOOLS = {
 def pre_chat(event):
     """Inject delegation tools into the active persona's enabled tool list."""
     try:
+        # Stash user input for prompt_inject scoring (it fires next but can't
+        # access user_input — the message isn't in chat history yet at that point)
+        import sys as _sys
+        shared = _sys.modules.get("persona_agents_shared")
+        if shared:
+            shared._last_user_input = event.input or ""
+
         system = event.metadata.get("system")
         if not system or not hasattr(system, "llm_chat") or not system.llm_chat:
             return

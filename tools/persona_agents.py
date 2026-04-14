@@ -1001,8 +1001,6 @@ class PersonaDelegate:
         returning empty or raw <think> tags to the lead.
         """
         try:
-            from core.chat.llm_providers import provider_manager
-
             # Build a minimal message list: system prompt + summary request
             messages = getattr(ctx, '_messages', []) or []
 
@@ -1019,8 +1017,8 @@ class PersonaDelegate:
                 {"role": "user", "content": summary_prompt}
             ]
 
-            # Get provider and make one more call with NO tools
-            provider = provider_manager.get_provider()
+            # Use the delegate's own provider (from ExecutionContext) — no separate import
+            provider = getattr(ctx, 'provider', None)
             if not provider:
                 logger.warning(f"[PERSONA-AGENT] {self.persona_name} no provider for summary call")
                 return _extract_thinking_content(raw_thinking)

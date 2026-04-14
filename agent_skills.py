@@ -70,6 +70,58 @@ _ROLE_APPROACHES = {
     ],
 }
 
+# ── Tandem-aware approach overrides (used when tandem tools detected) ────────
+_ROLE_APPROACHES_TANDEM = {
+    'Researcher': [
+        ('Research tasks', 'Search broadly with tandem_search or web_search, then drill into results with tandem_browse. Read content with tandem_read_page. Cross-reference across multiple sources before reporting.'),
+        ('Fact-checking', 'Verify claims against at least 2 independent sources. Note any contradictions.'),
+        ('News gathering', 'Search for recent coverage, check multiple outlets, distinguish fact from opinion.'),
+        ('Deep browsing', 'For multi-step research, use tandem_browse → tandem_wait → tandem_read_page → tandem_click_link → tandem_read_page to follow trails.'),
+    ],
+    'Financial Analyst': [
+        ('Stock research', 'Search for current data with tandem_search, then deep-dive via tandem_browse. Financial sites need JavaScript rendering — always use Tandem. Use tandem_extract for tables and numerical data.'),
+        ('Portfolio analysis', 'Gather current prices and yields via tandem_browse, use tandem_extract for data tables, present a clear summary with sources.'),
+        ('Market news', 'Check multiple financial news sources via tandem_browse, distinguish analysis from reporting, note the publication date.'),
+    ],
+    'Engineer': [
+        ('Building/coding', 'Understand the requirement first, check existing code if relevant, then implement. Test your work with run_command before reporting success.'),
+        ('Debugging', 'Reproduce the issue first, check logs, isolate the cause, then fix. Verify the fix works.'),
+        ('Documentation lookup', 'Use tandem_browse for documentation sites that need JavaScript. Use tandem_read_page to extract relevant sections.'),
+    ],
+    'System Administrator': [
+        ('Diagnostics', 'Check connectivity first (ping, DNS), then service status, then logs. Report findings in order.'),
+        ('Server work', 'Verify current state before making changes. Always have a rollback plan.'),
+        ('Documentation', 'Use tandem_browse for web-based documentation and dashboards.'),
+    ],
+}
+
+# ── Tandem Browser workflow (auto-injected when tandem tools in toolset) ─────
+_TANDEM_WORKFLOW = """## Tandem Browser Workflow
+Use Tandem Browser as your PRIMARY browsing tool. It renders full pages with JavaScript, handles sessions, and lets you interact with sites.
+
+1. **Navigate**: `tandem_browse` to open a URL
+2. **Wait**: `tandem_wait` after browsing to let the page load
+3. **Read**: `tandem_read_page` to get page text content
+4. **Extract**: `tandem_extract` for structured data (tables, lists)
+5. **Follow links**: `tandem_click_link` to follow interesting links
+6. **Search on-page**: `tandem_forms` to find search boxes, `tandem_type` to fill them, `tandem_press_key` to submit
+7. **Multi-tab**: `tandem_tabs` to list open tabs, `tandem_focus_tab` to switch between them, `tandem_close_tab` when done
+8. **Overview**: `tandem_awareness` for a quick page digest, `tandem_context` for active tab summary
+9. **Visual**: `tandem_screenshot` when you need to capture what you see
+10. **Fallback**: Use `get_website` ONLY when Tandem is unavailable or for simple static pages
+"""
+
+# ── MemPalace guidance (auto-injected when mempalace tools in toolset) ───────
+_MEMPALACE_GUIDANCE = """## Memory System (MemPalace)
+You use MemPalace for persistent memory — semantic retrieval with automatic cross-persona knowledge sharing.
+
+- **memory_remember**: Store important findings, insights, or facts. They persist across sessions.
+- **memory_recall**: Retrieve YOUR past memories on a topic (searches your personal wing).
+- **memory_search**: Search across ALL personas' memories — use when you need cross-team context.
+- Use `memory_remember` for anything worth keeping. If you discovered it and it matters, store it.
+- Use `memory_recall` before starting research to check if you already know something.
+"""
+
 
 def _ensure_dir():
     """Create skills directory if it doesn't exist."""
@@ -300,6 +352,7 @@ def generate_skills(persona_name):
     has_network = 'check_internet' in tool_names or 'website_status' in tool_names
     has_smarthome = 'ha_activate' in tool_names or 'ha_set_light' in tool_names
     has_browser = 'tandem_browse' in tool_names
+    has_mempalace = 'memory_remember' in tool_names
     has_persona_create = 'create_full_persona' in tool_names
     # Detect financial toolset by checking the toolset name directly
     # (save_knowledge is in most toolsets, so tool-presence alone is unreliable)
@@ -338,12 +391,16 @@ def generate_skills(persona_name):
         role_desc = "You handle specific tasks within your toolset."
 
     # ── Build YAML frontmatter ────────────────────────────────────────────────
-    triggers = _ROLE_TRIGGERS.get(role, [])
+    triggers = list(_ROLE_TRIGGERS.get(role, []))
+    if has_browser and 'browse' not in triggers:
+        triggers.extend(['browse', 'search for', 'open page', 'navigate to'])
     capabilities = sorted(tool_names & {
         'run_command', 'execute_code', 'web_search', 'research_topic',
         'get_website', 'check_internet', 'ha_activate', 'ha_set_light',
-        'ha_set_thermostat', 'tandem_browse', 'create_full_persona',
-        'get_images', 'get_youtube_transcript', 'save_knowledge',
+        'ha_set_thermostat', 'tandem_browse', 'tandem_search', 'tandem_read_page',
+        'tandem_extract', 'create_full_persona', 'get_images',
+        'get_youtube_transcript', 'save_knowledge', 'memory_remember',
+        'memory_recall', 'memory_search',
     })
 
     frontmatter_lines = [
@@ -362,7 +419,11 @@ def generate_skills(persona_name):
     frontmatter = '\n'.join(frontmatter_lines)
 
     # ── Build approach patterns ───────────────────────────────────────────────
-    approaches = _ROLE_APPROACHES.get(role, [])
+    # Use tandem-aware approaches when tandem tools are in the toolset
+    if has_browser and role in _ROLE_APPROACHES_TANDEM:
+        approaches = _ROLE_APPROACHES_TANDEM[role]
+    else:
+        approaches = _ROLE_APPROACHES.get(role, [])
     approach_section = ""
     if approaches:
         approach_lines = []
@@ -392,8 +453,31 @@ def generate_skills(persona_name):
         'ha_set_switch': 'Toggle switches and smart plugs.',
         'ha_list_areas': 'List available rooms/areas.',
         'ha_house_status': 'Full home state overview.',
-        'tandem_browse': 'Open and interact with web pages.',
-        'tandem_read_page': 'Read content from the current page.',
+        'tandem_browse': 'Navigate to a URL in Tandem Browser (full JavaScript rendering).',
+        'tandem_search': 'Search the web via Tandem Browser.',
+        'tandem_read_page': 'Read text content from the current page.',
+        'tandem_snapshot': 'Get a DOM snapshot of the page.',
+        'tandem_screenshot': 'Capture a visual screenshot of the page.',
+        'tandem_click_link': 'Click a link on the page to follow it.',
+        'tandem_type': 'Type text into a form field or input.',
+        'tandem_scroll': 'Scroll the page up or down.',
+        'tandem_wait': 'Wait for the page to finish loading.',
+        'tandem_extract': 'Extract structured data (tables, lists) from the page.',
+        'tandem_tabs': 'List all open browser tabs.',
+        'tandem_links': 'Get all links on the current page.',
+        'tandem_forms': 'List all forms on the page (search boxes, login forms, etc.).',
+        'tandem_close_tab': 'Close a browser tab.',
+        'tandem_status': 'Check if Tandem Browser is running and ready.',
+        'tandem_press_key': 'Press a key (Enter, Escape, Tab, arrows).',
+        'tandem_awareness': 'Get a quick digest/overview of the current page.',
+        'tandem_focus_tab': 'Switch focus to a specific tab.',
+        'tandem_context': 'Get a summary of the active tab (title, URL, state).',
+        'memory_remember': 'Store findings to MemPalace — persists across sessions.',
+        'memory_recall': 'Retrieve your past memories on a topic.',
+        'memory_search': 'Search across all personas\' memories for related knowledge.',
+        'memory_diary': 'Write a diary entry (personal reflections, session notes).',
+        'vault_write': 'Write to the Obsidian vault.',
+        'vault_read': 'Read from the Obsidian vault.',
         'create_full_persona': 'Create a complete new persona.',
         'research_character': 'Research a character for persona creation.',
         'save_knowledge': 'Save important findings to long-term memory.',
@@ -415,6 +499,24 @@ def generate_skills(persona_name):
     tools_section = "\n".join(tool_lines) if tool_lines else "- Use the tools available in your toolset."
     boundaries_section = "\n".join(boundaries) if boundaries else "- Stay within your area of expertise."
 
+    # ── Build optional capability sections ────────────────────────────────────
+    tandem_section = _TANDEM_WORKFLOW if has_browser else ""
+    mempalace_section = _MEMPALACE_GUIDANCE if has_mempalace else ""
+
+    # ── Build tips ────────────────────────────────────────────────────────────
+    tips = []
+    if 'shared_context_write' in tool_names:
+        tips.append("- If you find something other agents need to know, use shared_context_write.")
+    if has_mempalace:
+        tips.append("- Store key findings with memory_remember so they persist across sessions.")
+        tips.append("- Use memory_recall before starting work to check if you already know something.")
+    elif 'record_lesson' in tool_names:
+        tips.append("- If you learn something useful, use record_lesson to remember it for next time.")
+    if has_browser:
+        tips.append("- Use tandem_screenshot to capture visual evidence of your findings.")
+        tips.append("- Use get_website ONLY as a fallback when Tandem is unavailable.")
+    tips_section = "\n".join(tips) if tips else "- Stay focused on your assigned task."
+
     content = f"""{frontmatter}
 
 # {display_name} — {role}
@@ -422,14 +524,13 @@ def generate_skills(persona_name):
 {approach_section}## Your Role
 {role_desc}
 
-## When to Use Your Tools
+{tandem_section}{mempalace_section}## When to Use Your Tools
 {tools_section}
 
 ## What You Should NOT Do
 {boundaries_section}
 
 ## Tips
-- If you find something other agents need to know, use shared_context_write.
-- If you learn something useful, use record_lesson to remember it for next time.
+{tips_section}
 """
     return content.strip()

@@ -350,8 +350,28 @@ def _inject_roster(event):
             if active_toolset and toolset_manager.toolset_exists(active_toolset):
                 active_tools = toolset_manager.get_toolset_functions(active_toolset)
             # Grab the user's latest message for task analysis
+            # Priority 1: event metadata (older Sapphire versions passed it here)
+            # Priority 2: shared module (pre_chat hook stashes event.input before we fire)
+            # Priority 3: chat history fallback (gets previous turn's message)
             try:
                 user_message = event.metadata.get('user_message', '') or ''
+                if not user_message:
+                    shared = _get_shared()
+                    if shared:
+                        user_message = getattr(shared, '_last_user_input', '') or ''
+                if not user_message:
+                    messages = sys_obj.llm_chat.session_manager.current_chat.messages
+                    for msg in reversed(messages):
+                        if msg.get('role') == 'user':
+                            content = msg.get('content', '')
+                            if isinstance(content, str):
+                                user_message = content
+                            elif isinstance(content, list):
+                                user_message = ' '.join(
+                                    part.get('text', '') for part in content
+                                    if isinstance(part, dict) and part.get('type') == 'text'
+                                )
+                            break
             except Exception:
                 pass
             logger.debug(f"Active persona={active_persona!r}, toolset={active_toolset!r}, "
@@ -382,6 +402,17 @@ def _inject_roster(event):
     if _cached_triggers:
         logger.debug(f"[TRIGGER-SCORING] Loaded triggers for {len(_cached_triggers)} personas")
 
+    # ── Detect busy personas (currently running delegates) ────────────────
+    busy_personas = set()
+    try:
+        shared = _get_shared()
+        if shared and hasattr(shared, '_delegates'):
+            for d in shared._delegates.values():
+                if d.status == 'running':
+                    busy_personas.add(d.persona_name)
+    except Exception:
+        pass
+
     # ── Score every persona against the user's message ──────────────────────
     specialists = []   # (score, name, line, matched_tools)
     chat_only = []
@@ -406,16 +437,22 @@ def _inject_roster(event):
             tool_names = toolset_manager.get_toolset_functions(toolset)
 
         tool_count = len(tool_names) if toolset != "all" else 106
+        is_capable = _is_task_capable(tool_names)
 
-        if _is_task_capable(tool_names):
+        logger.info(f"[ROSTER-DEBUG] {name}: toolset={toolset}, tools={tool_count}, "
+                     f"capable={is_capable}, user_msg_len={len(user_message)}")
+
+        if is_capable:
             caps = _detect_capabilities(tool_names)
             score, matched, needed = _score_persona_for_task(tool_names, user_message, persona_name=name)
             cap_str = f" — can: {', '.join(caps[:5])}" if caps else ""
-            line = f"  - {name} [{toolset}, {tool_count} tools]{cap_str}"
+            busy_tag = "  🔄 BUSY" if name in busy_personas else ""
+            line = f"  - {name} [{toolset}, {tool_count} tools]{cap_str}{busy_tag}"
             specialists.append((score, name, line, matched))
         else:
             desc = f' — "{tagline}"' if tagline else ""
-            line = f"  - {name}{desc} [chat only, no task tools]"
+            busy_tag = "  🔄 BUSY" if name in busy_personas else ""
+            line = f"  - {name}{desc} [chat only, no task tools]{busy_tag}"
             chat_only.append(line)
 
     # Sort by score descending — best match for THIS task at the top
@@ -424,14 +461,15 @@ def _inject_roster(event):
     # Debug: log the scoring so we can verify task matching
     if specialists:
         score_summary = ", ".join(f"{name}={score}" for score, name, _, _ in specialists[:6])
-        logger.info(f"[TASK-SCORING] msg='{user_message[:80]}' → {score_summary}")
+        busy_str = f", busy=[{','.join(sorted(busy_personas))}]" if busy_personas else ""
+        logger.info(f"[TASK-SCORING] msg='{user_message[:80]}' → {score_summary}{busy_str}")
 
-    # Build the roster lines
+    # Build the roster lines — recommend the highest-ranked AVAILABLE persona
     specialist_lines = []
     best_pick = None
     for i, (score, name, line, matched) in enumerate(specialists):
-        if i == 0 and score > 0 and matched:
-            # Top scorer with actual tool matches = recommended pick
+        if score > 0 and matched and best_pick is None and name not in busy_personas:
+            # First available persona with actual tool matches = recommended pick
             best_pick = name
             line += f"  ⭐ BEST MATCH"
         specialist_lines.append(line)
@@ -448,14 +486,21 @@ def _inject_roster(event):
     if not roster_lines:
         return
 
-    rules = _build_delegation_rules(specialist_lines)
+    rules = _build_delegation_rules(specialist_lines, bool(busy_personas))
 
     # Build the recommendation line
     if best_pick:
-        recommend = (
-            f"\n⭐ RECOMMENDED: For this task, delegate to '{best_pick}' — "
-            f"they have the best tool match for what the user is asking.\n"
-        )
+        if busy_personas:
+            recommend = (
+                f"\n⭐ RECOMMENDED: '{best_pick}' is the best AVAILABLE match. "
+                f"Busy agents ({', '.join(sorted(busy_personas))}) are already working — "
+                f"send new tasks to available agents unless the task specifically needs a busy specialist.\n"
+            )
+        else:
+            recommend = (
+                f"\n⭐ RECOMMENDED: For this task, delegate to '{best_pick}' — "
+                f"they have the best tool match for what the user is asking.\n"
+            )
     else:
         recommend = ""
 
@@ -505,7 +550,7 @@ def _inject_roster(event):
     log_prompt_inject(len(roster_lines), active_persona or "")
 
 
-def _build_delegation_rules(specialist_lines):
+def _build_delegation_rules(specialist_lines, has_busy=False):
     """Build delegation rules dynamically from what specialists actually exist."""
     rules = []
 
@@ -521,10 +566,18 @@ def _build_delegation_rules(specialist_lines):
     if "smart home" in all_caps or "control lights" in all_caps:
         rules.append("- Smart home, lights, thermostat? → Pick the specialist with 'control smart home'")
 
-    # Universal rules
+    # Work distribution rules
     rules.append("- The roster is SORTED by match quality — the ⭐ BEST MATCH persona (if shown) is your first choice")
     rules.append("- NEVER delegate real tasks to 'chat only' personas — they cannot execute actions")
     rules.append("- If no ⭐ is shown, pick the top specialist whose capabilities fit the request")
+    rules.append("- SPREAD THE WORK: If the task has multiple sub-tasks, distribute them across "
+                 "different capable personas — don't pile everything on one agent")
+    rules.append("- BUSY agents (🔄) are already working. For NEW tasks, prefer an AVAILABLE agent "
+                 "with similar capabilities over waiting for the busy specialist")
+    if has_busy:
+        rules.append("- TIERED FALLBACK: If your #1 pick is BUSY, send to the next-ranked persona "
+                     "who has the right tools. Only wait for the specialist if the task truly requires "
+                     "their specific expertise (e.g. finance analysis needs the finance specialist)")
 
     return rules
 
