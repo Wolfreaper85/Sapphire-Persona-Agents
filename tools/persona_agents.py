@@ -707,6 +707,18 @@ class PersonaDelegate:
         self._thread.start()
 
     def _run(self):
+        # Set delegate identity for MemPalace (thread-local) so memory tools
+        # know which persona is calling from this delegate thread.
+        _mp_identity_set = False
+        try:
+            from plugins.mempalace.tools.mempalace_tools import set_delegate_persona, clear_delegate_persona
+            set_delegate_persona(self.persona_name)
+            _mp_identity_set = True
+        except ImportError:
+            pass  # MemPalace not installed — no-op
+        except Exception:
+            pass
+
         try:
             self._execute()
             if self.is_cancelled:
@@ -721,6 +733,12 @@ class PersonaDelegate:
             self.status = 'failed'
             self.error = str(e)
         finally:
+            # Clear delegate identity
+            if _mp_identity_set:
+                try:
+                    clear_delegate_persona()
+                except Exception:
+                    pass
             self.end_time = time.time()
             # Log result to dedicated log
             log_result(
