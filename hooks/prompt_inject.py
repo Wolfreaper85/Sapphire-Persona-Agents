@@ -481,7 +481,7 @@ def _inject_roster(event):
     if specialists:
         score_summary = ", ".join(f"{name}={score}" for score, name, _, _ in specialists[:6])
         busy_str = f", busy=[{','.join(sorted(busy_personas))}]" if busy_personas else ""
-        logger.info(f"[TASK-SCORING] msg='{user_message[:80]}' → {score_summary}{busy_str}")
+        logger.info(f"[TASK-SCORING] msg='{user_message[:80]}' -> {score_summary}{busy_str}")
 
     # Build the roster lines — recommend the highest-ranked AVAILABLE persona
     specialist_lines = []
