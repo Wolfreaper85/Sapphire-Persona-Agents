@@ -123,12 +123,31 @@ def should_use_mempalace():
 
 # ── Memory injection (for delegate system prompts) ───────────────────────────
 
+#: Name of the shared-identity wing. Data here is injected alongside every
+#: persona's own memory layers so cross-persona identity facts (owner name,
+#: aliases, location, preferences) reach every delegate automatically.
+#: Curated content lives in `vault/Sapphire/Memories/Profile/*.md` with
+#: frontmatter `persona: profile` and flows into this wing via the miner.
+PROFILE_WING = 'profile'
+
+
 def get_memory_injection(persona_name, task_text=''):
     """
     Get MemPalace memory layers for a persona to inject into a delegate's prompt.
 
     Returns a string block to append to the system prompt, or '' if unavailable.
     Called from PersonaDelegate._execute() AFTER ExecutionContext is created.
+
+    Layers returned (persona wing + profile wing):
+      - L0 persona           — identity blurb for this persona
+      - L1 persona           — persona's top-importance drawers
+      - L2 persona (if task) — on-demand semantic matches in persona's wing
+      - L1 profile           — curated cross-persona identity/context data
+      - L2 profile (if task) — on-demand semantic matches in profile wing
+
+    The profile wing holds shared facts (owner identity, location, aliases,
+    preferences) that every delegate needs regardless of which persona is
+    running. Keeps persona-specific memories separate from shared context.
 
     Args:
         persona_name: The delegate's persona name (used as wing key)
@@ -150,26 +169,50 @@ def get_memory_injection(persona_name, task_text=''):
         persona_key = persona_name.lower().strip()
         parts = []
 
+        # ── Persona wing (this delegate's own memories) ──────────────────
+
         # L0 — Identity (always)
         l0 = retrieval.get_l0(persona_key)
         if l0:
             parts.append(l0)
 
         # L1 — Essential Knowledge (always)
-        l1 = retrieval.get_l1(persona_key, max_tokens=600)
+        l1 = retrieval.get_l1(persona_key, max_tokens=500)
         if l1:
             parts.append(l1)
 
         # L2 — On-Demand Context (when task text provides relevance signal)
         if task_text:
-            l2 = retrieval.get_l2(persona_key, task_text, max_tokens=350, threshold=0.35)
+            l2 = retrieval.get_l2(persona_key, task_text, max_tokens=300, threshold=0.35)
             if l2:
                 parts.append(l2)
+
+        # ── Profile wing (shared owner identity — read by every persona) ─
+        # Skip when the persona IS profile to avoid duplicating L1.
+        if persona_key != PROFILE_WING:
+            try:
+                profile_l1 = retrieval.get_l1(PROFILE_WING, max_tokens=400)
+                if profile_l1:
+                    # Lightly label so the model knows this is cross-persona context
+                    parts.append(f"[Owner Profile — shared identity]\n{profile_l1}")
+
+                if task_text:
+                    profile_l2 = retrieval.get_l2(
+                        PROFILE_WING, task_text, max_tokens=300, threshold=0.35
+                    )
+                    if profile_l2:
+                        parts.append(f"[Owner Profile — relevant]\n{profile_l2}")
+            except Exception as e:
+                # Don't let profile-wing issues break persona injection
+                logger.debug(f"[MEMPALACE-BRIDGE] Profile wing retrieval skipped: {e}")
 
         if parts:
             header = "\n\n[MemPalace — Your Memories]\n"
             block = header + "\n".join(parts)
-            logger.info(f"[MEMPALACE-BRIDGE] Injected {len(parts)} memory layers for {persona_key}")
+            logger.info(
+                f"[MEMPALACE-BRIDGE] Injected {len(parts)} memory layers for "
+                f"{persona_key} (incl. profile wing)"
+            )
             return block
 
     except Exception as e:
